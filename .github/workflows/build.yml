@@ -1,0 +1,80 @@
+name: Build NixOS ASIF
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - flake.nix
+      - flake.lock
+      - configuration.nix
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-raw:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install Nix
+        run: |
+          sh <(curl -L https://nixos.org/nix/install) --daemon
+          echo "experimental-features = nix-command flakes" | sudo tee -a /etc/nix/nix.conf
+
+      - name: Generate version number
+        id: version
+        run: |
+          VERSION=$(date +'%y.%m').${{ github.run_number }}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build raw disk image
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix build .#packages.aarch64-linux.raw-efi --print-build-logs
+
+      - name: Prepare raw disk artifact
+        run: |
+          mkdir -p release
+          RAW_PATH=$(find "$(readlink -f result)" -type f -name '*.raw' | head -n 1)
+          test -n "$RAW_PATH"
+          cp "$RAW_PATH" release/nixos-${{ steps.version.outputs.version }}-aarch64.raw
+
+      - name: Upload raw disk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-disk-image
+          path: release/nixos-${{ steps.version.outputs.version }}-aarch64.raw
+          if-no-files-found: error
+          retention-days: 1
+
+  convert-asif:
+    needs: build-raw
+    runs-on: macos-26
+    steps:
+      - name: Download raw disk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-disk-image
+          path: raw-disk-image
+
+      - name: Convert raw disk image to ASIF
+        run: |
+          mkdir -p release
+          RAW_PATH=$(find raw-disk-image -type f -name '*.raw' | head -n 1)
+          test -n "$RAW_PATH"
+          diskutil image create from --format ASIF "$RAW_PATH" \
+            "release/nixos-${{ needs.build-raw.outputs.version }}-aarch64.asif"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.build-raw.outputs.version }}" \
+            --title "v${{ needs.build-raw.outputs.version }}" \
+            "release/nixos-${{ needs.build-raw.outputs.version }}-aarch64.asif"
