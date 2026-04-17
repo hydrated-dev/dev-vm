@@ -72,9 +72,9 @@
   };
   boot.loader.efi.canTouchEfiVariables = false;
 
-  image.baseName = "nixos-vzm";
-  image.extension = "raw";
-  image.modules = [ ];
+  image.modules.raw-efi = {
+    image.baseName = "nixos-vzm";
+  };
 
   virtualisation.diskSize = 12 * 1024;
 
