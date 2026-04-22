@@ -28,9 +28,9 @@
 
       guestBundle = pkgs.runCommand "guest-bundle" { } ''
         mkdir -p "$out"
-        ln -s ${vm.config.system.build.kernel}/${vm.config.system.boot.loader.kernelFile} "$out/kernel"
-        ln -s ${vm.config.system.build.netbootRamdisk} "$out/initrd"
-        ln -s ${guestManifest} "$out/manifest.json"
+        cp ${vm.config.system.build.kernel}/${vm.config.system.boot.loader.kernelFile} "$out/kernel"
+        cp ${vm.config.system.build.netbootRamdisk} "$out/initrd"
+        cp ${guestManifest} "$out/manifest.json"
       '';
     in
     {
