@@ -61,6 +61,7 @@
   nixpkgs.hostPlatform = lib.mkDefault "aarch64-linux";
 
   boot.kernelPackages = pkgs.linuxPackages_latest;
+  boot.supportedFilesystems.zfs = lib.mkForce false;
 
   networking.useDHCP = false;
   networking.interfaces = { };
