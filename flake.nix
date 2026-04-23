@@ -17,14 +17,11 @@
       };
 
       rootfsImage = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
-        storePaths = [ ];
+        storePaths = [ vm.config.system.build.toplevel ];
         compressImage = false;
         volumeLabel = "vzm-root";
         populateImageCommands = ''
-          mkdir -p ./files
-          tarball=$(find ${vm.config.system.build.rootfsTarball} -type f -name '*.tar' | head -n 1)
-          test -n "$tarball"
-          tar -C ./files -xf "$tarball"
+          mkdir -p ./files/dev ./files/proc ./files/sys ./files/run ./files/tmp
         '';
       };
 
@@ -33,7 +30,7 @@
           "console=hvc0"
           "root=LABEL=vzm-root"
           "rootfstype=ext4"
-          "init=/bin/init"
+          "init=${vm.config.system.build.toplevel}/init"
         ]
         ++ vm.config.boot.kernelParams
       );

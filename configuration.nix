@@ -170,22 +170,6 @@
     # Prevent zsh-newuser-install from hijacking the console on first login.
   '';
 
-  system.build.rootfsTarball = pkgs.callPackage "${pkgs.path}/nixos/lib/make-system-tarball.nix" {
-    storeContents = [
-      {
-        symlink = "/bin/init";
-        object = "${config.system.build.toplevel}/init";
-      }
-    ];
-    contents = [ ];
-    compressCommand = "cat";
-    compressionExtension = "";
-  };
-
-  system.activationScripts.installInitScript = ''
-    ln -fs $systemConfig/init /bin/init
-  '';
-
   boot.postBootCommands =
     ''
       if [ -f /nix-path-registration ]; then
