@@ -16,6 +16,8 @@ final class VirtualMachineRunner: NSObject {
     private var sigtermSource: DispatchSourceSignal?
     private let completionSemaphore = DispatchSemaphore(value: 0)
     private var exitError: Error?
+    private var consoleInputHandle: FileHandle?
+    private var consoleOutputHandle: FileHandle?
 
     init(
         config: VMConfig,
@@ -56,6 +58,7 @@ final class VirtualMachineRunner: NSObject {
         eventHandler("name: \(config.name)")
         eventHandler("bundle: \(config.bundlePath)")
         eventHandler("root mode: \(config.rootMode.rawValue)")
+        eventHandler("root disk: \(config.rootDiskPath)")
         eventHandler("data disk: \(config.dataDiskPath)")
         eventHandler("ssh port: \(config.hostSSHPort)")
         eventHandler("starting virtual machine")
@@ -72,6 +75,7 @@ final class VirtualMachineRunner: NSObject {
                     if let socketDevice = virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
                         let bridge = SSHBridge(
                             socketDevice: socketDevice,
+                            virtualMachineQueue: self.queue,
                             hostPort: self.config.hostSSHPort,
                             eventHandler: self.eventHandler
                         )
@@ -176,6 +180,10 @@ final class VirtualMachineRunner: NSObject {
         let platform = VZGenericPlatformConfiguration()
         platform.machineIdentifier = machineIdentifier
 
+        let rootDiskAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: config.rootDiskPath),
+            readOnly: false
+        )
         let dataDiskAttachment = try VZDiskImageStorageDeviceAttachment(
             url: URL(fileURLWithPath: config.dataDiskPath),
             readOnly: false
@@ -184,12 +192,30 @@ final class VirtualMachineRunner: NSObject {
         bootLoader.initialRamdiskURL = bundle.initrdURL
         bootLoader.commandLine = bundle.manifest.commandLine
 
+        guard let consoleInputHandle = FileHandle(forReadingAtPath: "/dev/null") else {
+            throw CLIError("failed to open /dev/null for guest console input")
+        }
+        let consoleOutputHandle = FileHandle.standardOutput
+        self.consoleInputHandle = consoleInputHandle
+        self.consoleOutputHandle = consoleOutputHandle
+
+        let consoleAttachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: consoleInputHandle,
+            fileHandleForWriting: consoleOutputHandle
+        )
+        let consolePort = VZVirtioConsoleDeviceSerialPortConfiguration()
+        consolePort.attachment = consoleAttachment
+
         let vmConfiguration = VZVirtualMachineConfiguration()
         vmConfiguration.bootLoader = bootLoader
         vmConfiguration.platform = platform
         vmConfiguration.memorySize = Constants.defaultMemoryBytes
         vmConfiguration.cpuCount = Constants.defaultCPUCount
-        vmConfiguration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: dataDiskAttachment)]
+        vmConfiguration.storageDevices = [
+            VZVirtioBlockDeviceConfiguration(attachment: rootDiskAttachment),
+            VZVirtioBlockDeviceConfiguration(attachment: dataDiskAttachment),
+        ]
+        vmConfiguration.serialPorts = [consolePort]
         vmConfiguration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         vmConfiguration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 

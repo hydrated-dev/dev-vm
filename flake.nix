@@ -16,10 +16,24 @@
         modules = [ ./configuration.nix ];
       };
 
+      rootfsImage = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
+        storePaths = [ ];
+        compressImage = false;
+        volumeLabel = "vzm-root";
+        populateImageCommands = ''
+          mkdir -p ./files
+          tarball=$(find ${vm.config.system.build.rootfsTarball} -type f -name '*.tar' | head -n 1)
+          test -n "$tarball"
+          tar -C ./files -xf "$tarball"
+        '';
+      };
+
       kernelCommandLine = nixpkgs.lib.concatStringsSep " " (
         [
           "console=hvc0"
-          "init=${vm.config.system.build.toplevel}/init"
+          "root=LABEL=vzm-root"
+          "rootfstype=ext4"
+          "init=/bin/init"
         ]
         ++ vm.config.boot.kernelParams
       );
@@ -29,15 +43,25 @@
         architecture = "aarch64";
         kernel = "kernel";
         initrd = "initrd";
-        rootMode = "ephemeral";
+        rootfs = "rootfs.ext4";
+        rootMode = "persistent";
         commandLine = kernelCommandLine;
         requiredDisks = [ "data" ];
       });
 
       guestBundle = pkgs.runCommand "guest-bundle" { } ''
         mkdir -p "$out"
+
         cp ${vm.config.system.build.kernel}/${vm.config.system.boot.loader.kernelFile} "$out/kernel"
-        cp ${vm.config.system.build.netbootRamdisk}/initrd "$out/initrd"
+
+        initrd_source=${vm.config.system.build.initialRamdisk}
+        if [ -d "$initrd_source" ]; then
+          cp "$initrd_source"/initrd "$out/initrd"
+        else
+          cp "$initrd_source" "$out/initrd"
+        fi
+
+        cp ${rootfsImage} "$out/rootfs.ext4"
         cp ${guestManifest} "$out/manifest.json"
       '';
     in

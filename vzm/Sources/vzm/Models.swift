@@ -2,7 +2,7 @@ import Foundation
 import Virtualization
 
 enum Constants {
-    static let configSchemaVersion = 2
+    static let configSchemaVersion = 3
     static let bundleSchemaVersion = 1
     static let guestSSHVsockPort: UInt32 = 2222
     static let defaultMemoryBytes: UInt64 = 4 * 1024 * 1024 * 1024
@@ -101,6 +101,7 @@ struct GuestBundleManifest: Codable {
     let architecture: String
     let kernel: String
     let initrd: String
+    let rootfs: String
     let rootMode: RootMode
     let commandLine: String
     let requiredDisks: [DiskRole]
@@ -112,6 +113,7 @@ struct ValidatedGuestBundle {
     let manifest: GuestBundleManifest
     let kernelURL: URL
     let initrdURL: URL
+    let rootfsURL: URL
 }
 
 struct VMConfig: Codable {
@@ -119,6 +121,7 @@ struct VMConfig: Codable {
     let name: String
     let bundlePath: String
     let hostSSHPort: UInt16
+    let rootDiskPath: String
     let dataDiskPath: String
     let dataDiskSizeBytes: UInt64
     let rootMode: RootMode
@@ -130,6 +133,7 @@ struct VMPaths {
     let config: URL
     let machineIdentifier: URL
     let disksDirectory: URL
+    let rootDisk: URL
     let dataDisk: URL
     let runtimeDirectory: URL
     let lock: URL
@@ -140,6 +144,7 @@ struct VMPaths {
         config = root.appendingPathComponent("config.json")
         machineIdentifier = root.appendingPathComponent("machine-identifier")
         disksDirectory = root.appendingPathComponent("disks", isDirectory: true)
+        rootDisk = disksDirectory.appendingPathComponent("root.img")
         dataDisk = disksDirectory.appendingPathComponent("data.img")
         runtimeDirectory = root.appendingPathComponent("runtime", isDirectory: true)
         lock = runtimeDirectory.appendingPathComponent("lock")

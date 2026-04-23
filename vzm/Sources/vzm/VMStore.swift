@@ -115,8 +115,8 @@ struct VMStore {
         guard manifest.architecture == Constants.supportedArchitecture else {
             throw CLIError("unsupported guest architecture '\(manifest.architecture)'; expected \(Constants.supportedArchitecture)")
         }
-        guard manifest.rootMode == .ephemeral else {
-            throw CLIError("unsupported root mode '\(manifest.rootMode.rawValue)'; only 'ephemeral' is currently supported")
+        guard manifest.rootMode == .persistent else {
+            throw CLIError("unsupported root mode '\(manifest.rootMode.rawValue)'; only 'persistent' is currently supported")
         }
         guard manifest.requiredDisks.contains(.data) else {
             throw CLIError("bundle manifest must declare a required 'data' disk")
@@ -127,6 +127,7 @@ struct VMStore {
 
         let kernelURL = try validateBundleFile(root: rootURL, relativePath: manifest.kernel, label: "kernel")
         let initrdURL = try validateBundleFile(root: rootURL, relativePath: manifest.initrd, label: "initrd")
+        let rootfsURL = try validateBundleFile(root: rootURL, relativePath: manifest.rootfs, label: "rootfs")
         guard !manifest.commandLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CLIError("bundle manifest commandLine must not be empty")
         }
@@ -136,7 +137,8 @@ struct VMStore {
             manifestURL: manifestURL,
             manifest: manifest,
             kernelURL: kernelURL,
-            initrdURL: initrdURL
+            initrdURL: initrdURL,
+            rootfsURL: rootfsURL
         )
     }
 
@@ -149,6 +151,19 @@ struct VMStore {
 
         guard ftruncate(fd, off_t(sizeBytes)) == 0 else {
             throw CLIError("failed to size disk image at '\(url.path)': \(String(cString: strerror(errno)))")
+        }
+    }
+
+    func cloneImage(from source: URL, to destination: URL) throws {
+        let result = source.withUnsafeFileSystemRepresentation { srcFS in
+            destination.withUnsafeFileSystemRepresentation { dstFS in
+                copyfile(srcFS, dstFS, nil, UInt32(COPYFILE_ALL | COPYFILE_CLONE))
+            }
+        }
+
+        guard result == 0 else {
+            let error = String(cString: strerror(errno))
+            throw CLIError("failed to clone image to '\(destination.path)': \(error)")
         }
     }
 

@@ -2,12 +2,12 @@
   modulesPath,
   pkgs,
   lib,
+  config,
   ...
 }:
 {
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
-    (modulesPath + "/installer/netboot/netboot-minimal.nix")
   ];
 
   nix.settings.experimental-features = [
@@ -19,6 +19,7 @@
 
   services.openssh = {
     enable = true;
+    startWhenNeeded = lib.mkForce false;
     settings = {
       PermitRootLogin = "no";
       PasswordAuthentication = false;
@@ -37,6 +38,10 @@
   systemd.user.extraConfig = ''
     DefaultUMask=0007
   '';
+
+  boot.loader.grub.enable = false;
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.efi.canTouchEfiVariables = false;
 
   boot.initrd.availableKernelModules = [
     "virtio_blk"
@@ -62,8 +67,15 @@
 
   boot.kernelPackages = pkgs.linuxPackages_latest;
   boot.supportedFilesystems.zfs = lib.mkForce false;
+  boot.kernelParams = [ "console=hvc0" ];
+
+  fileSystems."/" = {
+    device = "/dev/disk/by-label/vzm-root";
+    fsType = "ext4";
+  };
 
   networking.useDHCP = false;
+  networking.hostName = "vzm-guest";
   networking.interfaces = { };
   networking.firewall.enable = true;
   networking.firewall.allowedTCPPorts = [ 22 ];
@@ -99,18 +111,18 @@
       "systemd-udev-settle.service"
       "local-fs.target"
     ];
-    unitConfig.ConditionPathExists = "/dev/vda";
+    unitConfig.ConditionPathExists = "/dev/vdb";
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
     };
     script = ''
       mkdir -p /data
-      if ! ${pkgs.util-linux}/bin/blkid /dev/vda >/dev/null 2>&1; then
-        ${pkgs.e2fsprogs}/bin/mkfs.ext4 -F -L vzm-data /dev/vda
+      if ! ${pkgs.util-linux}/bin/blkid /dev/vdb >/dev/null 2>&1; then
+        ${pkgs.e2fsprogs}/bin/mkfs.ext4 -F -L vzm-data /dev/vdb
       fi
       if ! ${pkgs.util-linux}/bin/mountpoint -q /data; then
-        ${pkgs.util-linux}/bin/mount -t ext4 /dev/vda /data
+        ${pkgs.util-linux}/bin/mount -t ext4 /dev/vdb /data
       fi
       chown braden:braden /data
       chmod 700 /data
@@ -125,7 +137,7 @@
 
   environment.variables = {
     EDITOR = "vim";
-    VZM_ROOT_MODE = "ephemeral";
+    VZM_ROOT_MODE = "persistent";
     VZM_DATA_MOUNT = "/data";
   };
 
@@ -153,6 +165,37 @@
       "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMxUPJoiKdlvEq4+i4ZCl7lj1NOSgT7BsspqfgncdJKQVV5CKVZ1hnn/MNO4cAXRFOWjXkzowN+7mJZm8cVhP18="
     ];
   };
+
+  environment.etc."skel/.zshrc".text = ''
+    # Prevent zsh-newuser-install from hijacking the console on first login.
+  '';
+
+  system.build.rootfsTarball = pkgs.callPackage "${pkgs.path}/nixos/lib/make-system-tarball.nix" {
+    storeContents = [
+      {
+        symlink = "/bin/init";
+        object = "${config.system.build.toplevel}/init";
+      }
+    ];
+    contents = [ ];
+    compressCommand = "cat";
+    compressionExtension = "";
+  };
+
+  system.activationScripts.installInitScript = ''
+    ln -fs $systemConfig/init /bin/init
+  '';
+
+  boot.postBootCommands =
+    ''
+      if [ -f /nix-path-registration ]; then
+        ${config.nix.package.out}/bin/nix-store --load-db < /nix-path-registration
+        rm /nix-path-registration
+      fi
+    ''
+    + ''
+      ${config.nix.package.out}/bin/nix-env -p /nix/var/nix/profiles/system --set /run/current-system
+    '';
 
   system.stateVersion = "25.11";
 }

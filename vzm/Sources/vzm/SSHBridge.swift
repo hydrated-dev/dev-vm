@@ -4,14 +4,22 @@ import Virtualization
 
 final class SSHBridge: NSObject {
     private let socketDevice: VZVirtioSocketDevice
+    private let virtualMachineQueue: DispatchQueue
     private let hostPort: UInt16
     private let eventHandler: (String) -> Void
+    private let stateQueue = DispatchQueue(label: "vzm.ssh-bridge")
     private var listenerFD: Int32 = -1
     private var listenerSource: DispatchSourceRead?
     private var sessions: [UUID: BridgeSession] = [:]
 
-    init(socketDevice: VZVirtioSocketDevice, hostPort: UInt16, eventHandler: @escaping (String) -> Void) {
+    init(
+        socketDevice: VZVirtioSocketDevice,
+        virtualMachineQueue: DispatchQueue,
+        hostPort: UInt16,
+        eventHandler: @escaping (String) -> Void
+    ) {
         self.socketDevice = socketDevice
+        self.virtualMachineQueue = virtualMachineQueue
         self.hostPort = hostPort
         self.eventHandler = eventHandler
     }
@@ -20,7 +28,7 @@ final class SSHBridge: NSObject {
         listenerFD = try SocketSupport.createListeningSocket(port: hostPort)
         try SocketSupport.setNonBlocking(listenerFD)
 
-        let source = DispatchSource.makeReadSource(fileDescriptor: listenerFD, queue: .global())
+        let source = DispatchSource.makeReadSource(fileDescriptor: listenerFD, queue: stateQueue)
         source.setEventHandler { [weak self] in
             self?.acceptLoop()
         }
@@ -32,10 +40,12 @@ final class SSHBridge: NSObject {
     }
 
     func stop() {
-        listenerSource?.cancel()
-        listenerSource = nil
-        sessions.values.forEach { $0.close() }
-        sessions.removeAll()
+        stateQueue.sync {
+            listenerSource?.cancel()
+            listenerSource = nil
+            sessions.values.forEach { $0.close() }
+            sessions.removeAll()
+        }
     }
 
     private func acceptLoop() {
@@ -64,25 +74,36 @@ final class SSHBridge: NSObject {
                 continue
             }
 
-            socketDevice.connect(toPort: Constants.guestSSHVsockPort) { [weak self] result in
+            virtualMachineQueue.async { [weak self] in
                 guard let self else {
                     SocketSupport.closeQuietly(hostFD)
                     return
                 }
 
-                switch result {
-                case .success(let connection):
-                    let session = BridgeSession(
-                        hostFD: hostFD,
-                        guestConnection: connection
-                    ) { [weak self] identifier in
-                        self?.sessions.removeValue(forKey: identifier)
+                self.socketDevice.connect(toPort: Constants.guestSSHVsockPort) { [weak self] result in
+                    guard let self else {
+                        SocketSupport.closeQuietly(hostFD)
+                        return
                     }
-                    self.sessions[session.id] = session
-                    session.start()
-                case .failure(let error):
-                    SocketSupport.closeQuietly(hostFD)
-                    self.eventHandler("ssh forwarding connection failed: \(error.localizedDescription)")
+
+                    self.stateQueue.async {
+                        switch result {
+                        case .success(let connection):
+                            let session = BridgeSession(
+                                hostFD: hostFD,
+                                guestConnection: connection
+                            ) { [weak self] identifier in
+                                self?.stateQueue.async {
+                                    self?.sessions.removeValue(forKey: identifier)
+                                }
+                            }
+                            self.sessions[session.id] = session
+                            session.start()
+                        case .failure(let error):
+                            SocketSupport.closeQuietly(hostFD)
+                            self.eventHandler("ssh forwarding connection failed: \(error.localizedDescription)")
+                        }
+                    }
                 }
             }
         }
