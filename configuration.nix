@@ -29,6 +29,13 @@
     };
   };
 
+  programs.ssh.extraConfig = ''
+    Host github.com
+      HostName github.com
+      Port 22
+      ProxyCommand ${pkgs.socat}/bin/socat - VSOCK-CONNECT:2:2223
+  '';
+
   security = {
     sudo.wheelNeedsPassword = false;
     pam.enableUMask = true;

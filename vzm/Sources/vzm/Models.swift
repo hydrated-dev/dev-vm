@@ -7,6 +7,9 @@ enum Constants {
     static let guestSSHVsockPort: UInt32 = 22
     static let hostHTTPSProxyVsockPort: UInt32 = 3128
     static let hostHTTPSProxyCAPort: UInt32 = 3129
+    static let hostOutboundSSHVsockPort: UInt32 = 2223
+    static let initialOutboundSSHHost = "github.com"
+    static let initialOutboundSSHPort: UInt16 = 22
     static let initialHTTPSProxyAllowlist: Set<String> = ["google.com:443"]
     static let initialHTTPSRequestAllowlist: Set<String> = [
         "GET https://storage.googleapis.com/bushel-distro/bushelpowered.settings.gradle.kts",
