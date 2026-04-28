@@ -4,7 +4,7 @@ import Network
 import Security
 @preconcurrency import Virtualization
 
-final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate {
+final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchecked Sendable {
     private let socketDevice: VZVirtioSocketDevice
     private let eventHandler: (String) -> Void
     private let stateQueue = DispatchQueue(label: "vzm.https-proxy")
@@ -14,9 +14,15 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate {
     private var caConnections: [VZVirtioSocketConnection] = []
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
+    private weak var approvalController: HTTPSProxyApprovalController?
 
-    init(socketDevice: VZVirtioSocketDevice, eventHandler: @escaping (String) -> Void) throws {
+    init(
+        socketDevice: VZVirtioSocketDevice,
+        approvalController: HTTPSProxyApprovalController?,
+        eventHandler: @escaping (String) -> Void
+    ) throws {
         self.socketDevice = socketDevice
+        self.approvalController = approvalController
         self.eventHandler = eventHandler
         caStore = try ProxyCAStore()
         policy = HTTPSProxyPolicy(allowedDestinations: Constants.initialHTTPSProxyAllowlist)
@@ -33,6 +39,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate {
     func stop() {
         socketDevice.removeSocketListener(forPort: Constants.hostHTTPSProxyVsockPort)
         socketDevice.removeSocketListener(forPort: Constants.hostHTTPSProxyCAPort)
+        approvalController?.cancelAllPendingRequests()
         stateQueue.sync {
             sessions.values.forEach { $0.close() }
             sessions.removeAll()
@@ -62,6 +69,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate {
                 connection: connection,
                 caStore: self.caStore,
                 policy: self.policy,
+                approvalController: self.approvalController,
                 eventHandler: self.eventHandler
             ) { [weak self] id in
                 self?.stateQueue.async {
@@ -97,12 +105,13 @@ struct HTTPSProxyPolicy {
     }
 }
 
-final class HTTPSProxySession {
+final class HTTPSProxySession: @unchecked Sendable {
     let id = UUID()
 
     private let connection: VZVirtioSocketConnection
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
+    private weak var approvalController: HTTPSProxyApprovalController?
     private let eventHandler: (String) -> Void
     private let onClose: (UUID) -> Void
     private var thread: Thread?
@@ -112,12 +121,14 @@ final class HTTPSProxySession {
         connection: VZVirtioSocketConnection,
         caStore: ProxyCAStore,
         policy: HTTPSProxyPolicy,
+        approvalController: HTTPSProxyApprovalController?,
         eventHandler: @escaping (String) -> Void,
         onClose: @escaping (UUID) -> Void
     ) {
         self.connection = connection
         self.caStore = caStore
         self.policy = policy
+        self.approvalController = approvalController
         self.eventHandler = eventHandler
         self.onClose = onClose
     }
@@ -143,10 +154,11 @@ final class HTTPSProxySession {
 
         do {
             let request = try HTTPConnectRequest.read(from: guestFD)
-            guard policy.allows(host: request.host, port: request.port) else {
-                eventHandler("https proxy denied CONNECT \(request.host):\(request.port)")
-                SocketSupport.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", to: guestFD)
-                return
+            let approvalRequestID = try approve(request)
+            defer {
+                if let approvalRequestID {
+                    approvalController?.finishRequest(requestID: approvalRequestID)
+                }
             }
 
             SocketSupport.writeAll("HTTP/1.1 200 Connection Established\r\n\r\n", to: guestFD)
@@ -170,9 +182,39 @@ final class HTTPSProxySession {
             eventHandler("https proxy guest TLS established for \(request.host)")
             let upstreamConnection = try NetworkTLSConnection.connect(host: request.host, port: request.port)
             eventHandler("https proxy upstream TLS established for \(request.host):\(request.port)")
-            try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection)
+            let pathObserver = HTTPPathObserver { [weak self] path in
+                guard let approvalRequestID else { return }
+                self?.eventHandler("https proxy observed \(request.host) path \(path)")
+                self?.approvalController?.updatePath(requestID: approvalRequestID, path: path)
+            }
+            try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection, leftToRightObserver: pathObserver.observe)
         } catch {
             eventHandler("https proxy session failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func approve(_ request: HTTPConnectRequest) throws -> UUID? {
+        if policy.allows(host: request.host, port: request.port) {
+            return nil
+        }
+
+        guard let approvalController else {
+            throw CLIError("https proxy approval UI unavailable for CONNECT \(request.host):\(request.port)")
+        }
+
+        let (requestID, decision) = approvalController.requestApproval(host: request.host, port: request.port)
+        switch decision {
+        case .approve:
+            eventHandler("https proxy approved CONNECT \(request.host):\(request.port)")
+            return requestID
+        case .deny:
+            eventHandler("https proxy denied CONNECT \(request.host):\(request.port)")
+            SocketSupport.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", to: connection.fileDescriptor)
+            throw CLIError("CONNECT \(request.host):\(request.port) denied by user")
+        case .cancel:
+            eventHandler("https proxy cancelled CONNECT \(request.host):\(request.port)")
+            SocketSupport.writeAll("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", to: connection.fileDescriptor)
+            throw CLIError("CONNECT \(request.host):\(request.port) cancelled")
         }
     }
 }
@@ -461,7 +503,11 @@ enum NetworkTLSConnection {
 }
 
 enum NetworkConnectionRelay {
-    static func relay(left: NWConnection, right: NWConnection) throws {
+    static func relay(
+        left: NWConnection,
+        right: NWConnection,
+        leftToRightObserver: (@Sendable (Data) -> Void)? = nil
+    ) throws {
         let group = DispatchGroup()
         let errors = RelayErrorBox()
 
@@ -477,7 +523,7 @@ enum NetworkConnectionRelay {
                 right.cancel()
             }
             do {
-                try pump(from: left, to: right)
+                try pump(from: left, to: right, observer: leftToRightObserver)
             } catch {
                 record(error)
             }
@@ -503,12 +549,67 @@ enum NetworkConnectionRelay {
         }
     }
 
-    private static func pump(from source: NWConnection, to destination: NWConnection) throws {
+    private static func pump(
+        from source: NWConnection,
+        to destination: NWConnection,
+        observer: (@Sendable (Data) -> Void)? = nil
+    ) throws {
         while true {
             guard let data = try source.receiveBlocking(maxLength: 16 * 1024) else {
                 return
             }
+            observer?(data)
             try destination.sendBlocking(data)
+        }
+    }
+}
+
+final class HTTPPathObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private let onPath: @Sendable (String) -> Void
+    private var buffer = Data()
+    private var didResolve = false
+
+    init(onPath: @escaping @Sendable (String) -> Void) {
+        self.onPath = onPath
+    }
+
+    func observe(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !didResolve else { return }
+        buffer.append(data)
+
+        if buffer.starts(with: Data("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8)) {
+            didResolve = true
+            onPath("unavailable (HTTP/2)")
+            return
+        }
+
+        guard let headerEnd = buffer.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
+            if buffer.count > 16 * 1024 {
+                didResolve = true
+                onPath("unavailable")
+            }
+            return
+        }
+
+        let header = buffer.prefix(upTo: headerEnd)
+        guard let text = String(data: header, encoding: .utf8),
+              let requestLine = text.split(separator: "\r\n", maxSplits: 1).first else {
+            didResolve = true
+            onPath("unavailable")
+            return
+        }
+
+        let parts = requestLine.split(separator: " ")
+        if parts.count >= 2 {
+            didResolve = true
+            onPath(String(parts[1]))
+        } else {
+            didResolve = true
+            onPath("unavailable")
         }
     }
 }

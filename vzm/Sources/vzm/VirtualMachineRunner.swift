@@ -6,6 +6,7 @@ final class VirtualMachineRunner: NSObject {
     private let config: VMConfig
     private let bundle: ValidatedGuestBundle
     private let machineIdentifier: VZGenericMachineIdentifier
+    private weak var approvalController: HTTPSProxyApprovalController?
     private let eventHandler: (String) -> Void
     private let queue = DispatchQueue(label: "vzm.vm")
     private let signalQueue = DispatchQueue(label: "vzm.signal")
@@ -25,11 +26,13 @@ final class VirtualMachineRunner: NSObject {
         config: VMConfig,
         bundle: ValidatedGuestBundle,
         machineIdentifier: VZGenericMachineIdentifier,
+        approvalController: HTTPSProxyApprovalController?,
         eventHandler: @escaping (String) -> Void
     ) {
         self.config = config
         self.bundle = bundle
         self.machineIdentifier = machineIdentifier
+        self.approvalController = approvalController
         self.eventHandler = eventHandler
     }
 
@@ -79,6 +82,7 @@ final class VirtualMachineRunner: NSObject {
                         do {
                             let proxy = try HTTPSProxyManager(
                                 socketDevice: socketDevice,
+                                approvalController: self.approvalController,
                                 eventHandler: self.eventHandler
                             )
                             proxy.start()

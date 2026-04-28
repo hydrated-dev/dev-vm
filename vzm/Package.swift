@@ -16,6 +16,7 @@ let package = Package(
                 .linkedFramework("Virtualization"),
                 .linkedFramework("Network"),
                 .linkedFramework("Security"),
+                .linkedFramework("AppKit"),
             ]
         ),
     ]

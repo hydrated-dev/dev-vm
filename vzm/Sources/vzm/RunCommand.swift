@@ -1,3 +1,4 @@
+@preconcurrency import AppKit
 import Foundation
 
 struct RunCommand {
@@ -22,14 +23,61 @@ struct RunCommand {
             runtimeLock.release()
         }
 
-        let runner = VirtualMachineRunner(
-            config: config,
-            bundle: bundle,
-            machineIdentifier: machineIdentifier
-        ) { message in
+        let eventHandler: (String) -> Void = { message in
             let output = message.contains("failure") || message.contains("error") ? stderr : stdout
             fputs("\(message)\n", output)
         }
-        try runner.run()
+
+        let approvalController = MenuBarProxyApprovalController(eventHandler: eventHandler)
+        approvalController.start()
+
+        let runner = VirtualMachineRunner(
+            config: config,
+            bundle: bundle,
+            machineIdentifier: machineIdentifier,
+            approvalController: approvalController,
+            eventHandler: eventHandler
+        )
+        approvalController.stopRequested = {
+            runner.requestShutdown()
+        }
+
+        let runError = SynchronizedValue<Error?>(nil)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try runner.run()
+            } catch {
+                runError.set(error)
+            }
+
+            DispatchQueue.main.async {
+                approvalController.stop()
+                NSApplication.shared.stop(nil)
+                Self.wakeApplicationEventLoop()
+            }
+        }
+
+        NSApplication.shared.run()
+
+        if let error = runError.value {
+            throw error
+        }
+    }
+
+    private static func wakeApplicationEventLoop() {
+        guard let event = NSEvent.otherEvent(
+            with: .applicationDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: 0,
+            data1: 0,
+            data2: 0
+        ) else {
+            return
+        }
+        NSApplication.shared.postEvent(event, atStart: false)
     }
 }
