@@ -53,4 +53,54 @@ enum SocketSupport {
         _ = shutdown(fd, SHUT_RDWR)
         _ = close(fd)
     }
+
+    static func writeAll(_ string: String, to fd: Int32) {
+        guard let data = string.data(using: .utf8) else { return }
+        data.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            var written = 0
+            while written < bytes.count {
+                let count = write(fd, baseAddress.advanced(by: written), bytes.count - written)
+                if count <= 0 {
+                    return
+                }
+                written += count
+            }
+        }
+    }
+
+    static func connectTCP(host: String, port: UInt16) throws -> Int32 {
+        var hints = addrinfo(
+            ai_flags: 0,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: IPPROTO_TCP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, String(port), &hints, &result)
+        guard status == 0, let result else {
+            throw CLIError("failed to resolve \(host): \(String(cString: gai_strerror(status)))")
+        }
+        defer { freeaddrinfo(result) }
+
+        var cursor: UnsafeMutablePointer<addrinfo>? = result
+        var lastError = "unknown error"
+        while let info = cursor {
+            let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
+            if fd >= 0 {
+                if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
+                    return fd
+                }
+                lastError = String(cString: strerror(errno))
+                closeQuietly(fd)
+            }
+            cursor = info.pointee.ai_next
+        }
+
+        throw CLIError("failed to connect to \(host):\(port): \(lastError)")
+    }
 }

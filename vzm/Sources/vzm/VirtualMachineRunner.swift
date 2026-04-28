@@ -12,6 +12,7 @@ final class VirtualMachineRunner: NSObject {
 
     private var virtualMachine: VZVirtualMachine?
     private var bridge: SSHBridge?
+    private var httpsProxy: HTTPSProxyManager?
     private var delegateRef: VMDelegate?
     private var sigintSource: DispatchSourceSignal?
     private var sigtermSource: DispatchSourceSignal?
@@ -49,6 +50,7 @@ final class VirtualMachineRunner: NSObject {
                 } else {
                     self?.eventHandler("guest stopped")
                 }
+                self?.httpsProxy?.stop()
                 self?.bridge?.stop()
                 self?.completionSemaphore.signal()
             }
@@ -74,13 +76,22 @@ final class VirtualMachineRunner: NSObject {
                         return
                     }
                     if let socketDevice = virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
-                        let bridge = SSHBridge(
-                            socketDevice: socketDevice,
-                            virtualMachineQueue: self.queue,
-                            hostPort: self.config.hostSSHPort,
-                            eventHandler: self.eventHandler
-                        )
                         do {
+                            let proxy = try HTTPSProxyManager(
+                                socketDevice: socketDevice,
+                                eventHandler: self.eventHandler
+                            )
+                            proxy.start()
+                            self.httpsProxy = proxy
+                            self.eventHandler("https proxy listening on vsock port \(Constants.hostHTTPSProxyVsockPort)")
+                            self.eventHandler("https proxy allowlist: \(Constants.initialHTTPSProxyAllowlist.sorted().joined(separator: ", "))")
+
+                            let bridge = SSHBridge(
+                                socketDevice: socketDevice,
+                                virtualMachineQueue: self.queue,
+                                hostPort: self.config.hostSSHPort,
+                                eventHandler: self.eventHandler
+                            )
                             try bridge.start()
                             self.bridge = bridge
                             self.eventHandler("ssh bridge listening on 127.0.0.1:\(self.config.hostSSHPort)")

@@ -15,6 +15,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Virtualization"),
                 .linkedFramework("Network"),
+                .linkedFramework("Security"),
             ]
         ),
     ]

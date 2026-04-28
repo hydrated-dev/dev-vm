@@ -107,6 +107,7 @@
   };
 
   environment.systemPackages = with pkgs; [
+    socat
     vim
   ];
 
@@ -116,6 +117,42 @@
     EDITOR = "vim";
     VZM_ROOT_MODE = "persistent";
     VZM_DATA_MOUNT = "/data";
+    HTTP_PROXY = "http://127.0.0.1:3128";
+    HTTPS_PROXY = "http://127.0.0.1:3128";
+    http_proxy = "http://127.0.0.1:3128";
+    https_proxy = "http://127.0.0.1:3128";
+    NO_PROXY = "localhost,127.0.0.1,::1";
+    no_proxy = "localhost,127.0.0.1,::1";
+    SSL_CERT_FILE = "/run/vzm/ca-bundle.crt";
+    NIX_SSL_CERT_FILE = "/run/vzm/ca-bundle.crt";
+  };
+
+  systemd.services.vzm-proxy-ca = {
+    description = "Fetch the vzm HTTPS proxy CA from the host";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-modules-load.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      mkdir -p /run/vzm
+      ${pkgs.socat}/bin/socat -u VSOCK-CONNECT:2:3129 - > /run/vzm/proxy-ca.pem
+      cat /etc/ssl/certs/ca-certificates.crt /run/vzm/proxy-ca.pem > /run/vzm/ca-bundle.crt
+      chmod 0644 /run/vzm/proxy-ca.pem /run/vzm/ca-bundle.crt
+    '';
+  };
+
+  systemd.services.vzm-https-proxy = {
+    description = "Expose the host vzm HTTPS proxy on localhost";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "vzm-proxy-ca.service" ];
+    requires = [ "vzm-proxy-ca.service" ];
+    serviceConfig = {
+      ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork VSOCK-CONNECT:2:3128";
+      Restart = "always";
+      RestartSec = "1s";
+    };
   };
 
   programs.zsh.enable = true;
