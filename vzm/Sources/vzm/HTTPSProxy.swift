@@ -605,8 +605,6 @@ struct MutatedHTTPRequest {
 }
 
 final class ProxyCAStore {
-    private static let leafIdentityPassphrase = "vzm-proxy"
-
     let caCertificatePEM: Data
 
     private let root: URL
@@ -646,29 +644,31 @@ final class ProxyCAStore {
     func identity(for host: String) throws -> ProxyIdentity {
         let safeHost = host.replacingOccurrences(of: ".", with: "_")
         let key = leafDirectory.appendingPathComponent("\(safeHost).key")
+        let keyDER = leafDirectory.appendingPathComponent("\(safeHost).key.der")
         let csr = leafDirectory.appendingPathComponent("\(safeHost).csr")
         let cert = leafDirectory.appendingPathComponent("\(safeHost).pem")
+        let certDER = leafDirectory.appendingPathComponent("\(safeHost).der")
         let ext = leafDirectory.appendingPathComponent("\(safeHost).ext")
-        let p12 = leafDirectory.appendingPathComponent("\(safeHost).p12")
 
-        if !fileManager.fileExists(atPath: p12.path) {
-            try generateLeafIdentity(host: host, key: key, csr: csr, cert: cert, ext: ext, p12: p12)
+        if !fileManager.fileExists(atPath: key.path) || !fileManager.fileExists(atPath: cert.path) {
+            try generateLeafIdentity(host: host, key: key, keyDER: keyDER, csr: csr, cert: cert, certDER: certDER, ext: ext)
         }
 
         do {
-            return try importLeafIdentity(host: host, p12: p12)
+            return try loadLeafIdentity(host: host, key: key, keyDER: keyDER, cert: cert, certDER: certDER)
         } catch {
             try? fileManager.removeItem(at: key)
+            try? fileManager.removeItem(at: keyDER)
             try? fileManager.removeItem(at: csr)
             try? fileManager.removeItem(at: cert)
+            try? fileManager.removeItem(at: certDER)
             try? fileManager.removeItem(at: ext)
-            try? fileManager.removeItem(at: p12)
-            try generateLeafIdentity(host: host, key: key, csr: csr, cert: cert, ext: ext, p12: p12)
-            return try importLeafIdentity(host: host, p12: p12)
+            try generateLeafIdentity(host: host, key: key, keyDER: keyDER, csr: csr, cert: cert, certDER: certDER, ext: ext)
+            return try loadLeafIdentity(host: host, key: key, keyDER: keyDER, cert: cert, certDER: certDER)
         }
     }
 
-    private func generateLeafIdentity(host: String, key: URL, csr: URL, cert: URL, ext: URL, p12: URL) throws {
+    private func generateLeafIdentity(host: String, key: URL, keyDER: URL, csr: URL, cert: URL, certDER: URL, ext: URL) throws {
         try Self.runOpenSSL([
             "req", "-newkey", "rsa:2048", "-nodes",
             "-keyout", key.path,
@@ -693,29 +693,58 @@ final class ProxyCAStore {
             "-extfile", ext.path
         ])
         try Self.runOpenSSL([
-            "pkcs12", "-export",
-            "-inkey", key.path,
+            "rsa",
+            "-in", key.path,
+            "-outform", "DER",
+            "-out", keyDER.path
+        ])
+        try Self.runOpenSSL([
+            "x509",
             "-in", cert.path,
-            "-certfile", caCertificate.path,
-            "-out", p12.path,
-            "-passout", "pass:\(Self.leafIdentityPassphrase)"
+            "-outform", "DER",
+            "-out", certDER.path
         ])
     }
 
-    private func importLeafIdentity(host: String, p12: URL) throws -> ProxyIdentity {
-        let data = try Data(contentsOf: p12)
-        var items: CFArray?
-        let status = SecPKCS12Import(
-            data as CFData,
-            [kSecImportExportPassphrase: Self.leafIdentityPassphrase] as CFDictionary,
-            &items
-        )
-        guard status == errSecSuccess,
-              let item = (items as? [[String: Any]])?.first,
-              let identityValue = item[kSecImportItemIdentity as String] else {
-            throw CLIError("failed to import generated leaf identity for \(host): \(status)")
+    private func loadLeafIdentity(host: String, key: URL, keyDER: URL, cert: URL, certDER: URL) throws -> ProxyIdentity {
+        if !fileManager.fileExists(atPath: keyDER.path) {
+            try Self.runOpenSSL([
+                "rsa",
+                "-in", key.path,
+                "-outform", "DER",
+                "-out", keyDER.path
+            ])
         }
-        return ProxyIdentity(identity: identityValue as! SecIdentity, caCertificate: try caSecCertificate())
+        if !fileManager.fileExists(atPath: certDER.path) {
+            try Self.runOpenSSL([
+                "x509",
+                "-in", cert.path,
+                "-outform", "DER",
+                "-out", certDER.path
+            ])
+        }
+
+        let keyData = try Data(contentsOf: keyDER)
+        var keyError: Unmanaged<CFError>?
+        let keyAttributes: [CFString: Any] = [
+            kSecAttrKeyType: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass: kSecAttrKeyClassPrivate,
+            kSecAttrKeySizeInBits: 2048,
+            kSecReturnPersistentRef: false
+        ]
+        guard let privateKey = SecKeyCreateWithData(keyData as CFData, keyAttributes as CFDictionary, &keyError) else {
+            let message = keyError?.takeRetainedValue().localizedDescription ?? "unknown error"
+            throw CLIError("failed to load generated leaf private key for \(host): \(message)")
+        }
+
+        let certificateData = try Data(contentsOf: certDER)
+        guard let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else {
+            throw CLIError("failed to load generated leaf certificate for \(host)")
+        }
+        guard let identity = SecIdentityCreate(nil, certificate, privateKey) else {
+            throw CLIError("failed to create generated leaf identity for \(host)")
+        }
+        return ProxyIdentity(identity: identity, caCertificate: try caSecCertificate())
     }
 
     private func caSecCertificate() throws -> SecCertificate {
