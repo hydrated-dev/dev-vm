@@ -19,6 +19,8 @@ struct ProxyApprovalRequest: Sendable {
     let destination: String
     let detail: String
     let protocolName: String
+    let usesSecret: Bool
+    let secretNames: [String]
 
     static func https(_ request: HTTPSProxyRequest) -> ProxyApprovalRequest {
         ProxyApprovalRequest(
@@ -26,7 +28,9 @@ struct ProxyApprovalRequest: Sendable {
             title: request.displayName,
             destination: request.url,
             detail: "URL: \(request.url)",
-            protocolName: request.httpVersion
+            protocolName: request.httpVersion,
+            usesSecret: !request.secretNames.isEmpty,
+            secretNames: request.secretNames
         )
     }
 
@@ -36,7 +40,9 @@ struct ProxyApprovalRequest: Sendable {
             title: "SSH \(host):\(port)",
             destination: "\(host):\(port)",
             detail: "Destination: \(host):\(port)",
-            protocolName: "SSH"
+            protocolName: "SSH",
+            usesSecret: false,
+            secretNames: []
         )
     }
 
@@ -293,11 +299,16 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
 
         if let request {
             let countPrefix = count > 1 ? "(\(count)) " : ""
-            statusItem?.button?.title = "vzm \(countPrefix)\(request.request.menuBarTitle)"
+            let secretPrefix = request.request.usesSecret ? "⚠ " : ""
+            statusItem?.button?.title = "vzm \(countPrefix)\(secretPrefix)\(request.request.menuBarTitle)"
             currentItem?.title = "Pending: \(request.destination)"
             currentItem?.isEnabled = false
             urlItem?.title = request.request.detail
-            protocolItem?.title = "Protocol: \(request.request.protocolName)"
+            if request.request.usesSecret {
+                protocolItem?.title = "Secret used: \(request.request.secretNames.joined(separator: ", "))"
+            } else {
+                protocolItem?.title = "Protocol: \(request.request.protocolName)"
+            }
             approveItem?.isEnabled = count > 0
             denyItem?.isEnabled = count > 0
         } else {

@@ -13,6 +13,8 @@ struct CLI {
             command = .create(try Self.parseCreate(arguments: Array(arguments.dropFirst())))
         case "run":
             command = .run(try Self.parseRun(arguments: Array(arguments.dropFirst())))
+        case "secret":
+            command = .secret(try Self.parseSecret(arguments: Array(arguments.dropFirst())))
         case "--help", "-h", "help":
             throw CLIError(Self.usage())
         default:
@@ -21,13 +23,21 @@ struct CLI {
     }
 
     func run() throws {
-        let store = try VMStore()
-
         switch command {
         case .create(let options):
+            let store = try VMStore()
             try CreateCommand(store: store).run(options: options)
         case .run(let options):
+            let store = try VMStore()
             try RunCommand(store: store).run(options: options)
+        case .secret(let command):
+            let secretCommand = SecretCommand()
+            switch command {
+            case .create(let options):
+                try secretCommand.create(options: options)
+            case .delete(let options):
+                try secretCommand.delete(options: options)
+            }
         }
     }
 
@@ -101,18 +111,95 @@ struct CLI {
         return RunOptions(name: try VMName(rawValue: nameArgument))
     }
 
+    private static func parseSecret(arguments: [String]) throws -> SecretSubcommand {
+        guard let subcommand = arguments.first else {
+            throw CLIError(secretUsage())
+        }
+
+        switch subcommand {
+        case "create":
+            return .create(try parseSecretCreate(arguments: Array(arguments.dropFirst())))
+        case "delete":
+            return .delete(try parseSecretDelete(arguments: Array(arguments.dropFirst())))
+        case "--help", "-h", "help":
+            throw CLIError(secretUsage())
+        default:
+            throw CLIError("unknown secret command '\(subcommand)'\n\n" + secretUsage())
+        }
+    }
+
+    private static func parseSecretCreate(arguments: [String]) throws -> SecretCreateOptions {
+        var name: String?
+        var domains: [String] = []
+        var index = 0
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--name":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError("missing value for --name")
+                }
+                name = arguments[index]
+            case "--domain":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError("missing value for --domain")
+                }
+                domains.append(arguments[index])
+            case "--help", "-h":
+                throw CLIError("usage: vzm secret create --name <display-name> [--domain <host>]...")
+            default:
+                throw CLIError("unknown argument '\(argument)'")
+            }
+            index += 1
+        }
+
+        guard let name else {
+            throw CLIError("missing required --name")
+        }
+        return SecretCreateOptions(name: name, domains: domains)
+    }
+
+    private static func parseSecretDelete(arguments: [String]) throws -> SecretDeleteOptions {
+        guard arguments.count == 1 else {
+            throw CLIError("usage: vzm secret delete <uuid>")
+        }
+        guard let id = UUID(uuidString: arguments[0]) else {
+            throw CLIError("invalid secret uuid '\(arguments[0])'")
+        }
+        return SecretDeleteOptions(id: id)
+    }
+
     private static func usage() -> String {
         """
         usage:
           vzm create <name> --bundle <path> --ssh-port <port> --data-disk-size <size>
           vzm run <name>
+          vzm secret create --name <display-name> [--domain <host>]...
+          vzm secret delete <uuid>
+        """
+    }
+
+    private static func secretUsage() -> String {
+        """
+        usage:
+          vzm secret create --name <display-name> [--domain <host>]...
+          vzm secret delete <uuid>
         """
     }
 
     private enum Command {
         case create(CreateOptions)
         case run(RunOptions)
+        case secret(SecretSubcommand)
     }
+}
+
+enum SecretSubcommand {
+    case create(SecretCreateOptions)
+    case delete(SecretDeleteOptions)
 }
 
 struct CreateOptions {

@@ -14,6 +14,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
     private var caConnections: [VZVirtioSocketConnection] = []
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
+    private let secretStore: SecretStore
     private weak var approvalController: ProxyApprovalController?
 
     init(
@@ -26,6 +27,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
         self.eventHandler = eventHandler
         caStore = try ProxyCAStore()
         policy = HTTPSProxyPolicy(allowedDestinations: Constants.initialHTTPSProxyAllowlist)
+        secretStore = SecretStore()
         super.init()
         proxyListener.delegate = self
         caListener.delegate = self
@@ -69,6 +71,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
                 connection: connection,
                 caStore: self.caStore,
                 policy: self.policy,
+                secretStore: self.secretStore,
                 approvalController: self.approvalController,
                 eventHandler: self.eventHandler
             ) { [weak self] id in
@@ -122,6 +125,7 @@ struct HTTPSProxyRequest: Sendable {
     let path: String
     let url: String
     let httpVersion: String
+    let secretNames: [String]
 
     var policyKey: String {
         "\(method.uppercased()) \(url)"
@@ -138,6 +142,7 @@ final class HTTPSProxySession: @unchecked Sendable {
     private let connection: VZVirtioSocketConnection
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
+    private let secretStore: SecretStore
     private weak var approvalController: ProxyApprovalController?
     private let eventHandler: (String) -> Void
     private let onClose: (UUID) -> Void
@@ -148,6 +153,7 @@ final class HTTPSProxySession: @unchecked Sendable {
         connection: VZVirtioSocketConnection,
         caStore: ProxyCAStore,
         policy: HTTPSProxyPolicy,
+        secretStore: SecretStore,
         approvalController: ProxyApprovalController?,
         eventHandler: @escaping (String) -> Void,
         onClose: @escaping (UUID) -> Void
@@ -155,6 +161,7 @@ final class HTTPSProxySession: @unchecked Sendable {
         self.connection = connection
         self.caStore = caStore
         self.policy = policy
+        self.secretStore = secretStore
         self.approvalController = approvalController
         self.eventHandler = eventHandler
         self.onClose = onClose
@@ -218,9 +225,21 @@ final class HTTPSProxySession: @unchecked Sendable {
                 try? guestConnection.sendBlocking(rejected.responseData)
                 throw error
             }
+            let mutatedRequest: MutatedHTTPRequest
+            do {
+                mutatedRequest = try HTTPRequestMutator(secretStore: secretStore).mutate(initialRequest)
+            } catch {
+                let rejected = HTTPSProxyDeniedError(
+                    status: 502,
+                    reason: "Bad Gateway",
+                    message: error.localizedDescription
+                )
+                try? guestConnection.sendBlocking(rejected.responseData)
+                throw error
+            }
             let approvalRequestID: UUID?
             do {
-                approvalRequestID = try approve(initialRequest.request)
+                approvalRequestID = try approve(mutatedRequest.request)
             } catch let denied as HTTPSProxyDeniedError {
                 try? guestConnection.sendBlocking(denied.responseData)
                 throw denied
@@ -233,7 +252,7 @@ final class HTTPSProxySession: @unchecked Sendable {
 
             let upstreamConnection = try NetworkTLSConnection.connect(host: connectRequest.host, port: connectRequest.port)
             eventHandler("https proxy upstream TLS established for \(connectRequest.host):\(connectRequest.port)")
-            try HTTPRequestMutator().mutate(initialRequest).write(to: upstreamConnection)
+            try mutatedRequest.write(to: upstreamConnection)
             try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection)
         } catch {
             eventHandler("https proxy session failed: \(error.localizedDescription)")
@@ -335,6 +354,8 @@ struct HTTPConnectRequest {
 struct ParsedHTTPRequest {
     let request: HTTPSProxyRequest
     let bytes: Data
+    let bodyStartIndex: Int
+    let contentLength: Int?
 }
 
 enum HTTPRequestParser {
@@ -356,7 +377,21 @@ enum HTTPRequestParser {
                 throw CLIError("guest attempted HTTP/2 despite proxy HTTP/1.1 ALPN")
             }
             if data.range(of: headerTerminator) != nil {
-                return try parse(data, connectHost: connectHost, connectPort: connectPort)
+                var parsed = try parse(data, connectHost: connectHost, connectPort: connectPort)
+                if let contentLength = parsed.contentLength {
+                    guard contentLength <= Constants.maxHTTPSProxyBufferedBodyBytes else {
+                        throw CLIError("HTTP request body exceeded \(Constants.maxHTTPSProxyBufferedBodyBytes) byte proxy buffering limit")
+                    }
+                    let expectedByteCount = parsed.bodyStartIndex + contentLength
+                    while data.count < expectedByteCount {
+                        guard let chunk = try connection.receiveBlocking(maxLength: min(16 * 1024, expectedByteCount - data.count)) else {
+                            throw CLIError("guest closed TLS before sending complete HTTP request body")
+                        }
+                        data.append(chunk)
+                    }
+                    parsed = try parse(data, connectHost: connectHost, connectPort: connectPort)
+                }
+                return parsed
             }
         }
 
@@ -367,6 +402,7 @@ enum HTTPRequestParser {
         guard let headerEnd = data.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
             throw CLIError("HTTP request headers were incomplete")
         }
+        let bodyStartIndex = headerEnd + 4
         let headerBytes = data.prefix(upTo: headerEnd)
         guard let headerText = String(data: headerBytes, encoding: .utf8) else {
             throw CLIError("HTTP request headers were not valid UTF-8")
@@ -420,9 +456,15 @@ enum HTTPRequestParser {
             port: requestPort,
             path: path,
             url: url,
-            httpVersion: version
+            httpVersion: version,
+            secretNames: []
         )
-        return ParsedHTTPRequest(request: request, bytes: data)
+        return ParsedHTTPRequest(
+            request: request,
+            bytes: data,
+            bodyStartIndex: bodyStartIndex,
+            contentLength: try contentLength(in: lines)
+        )
     }
 
     private static func headerValue(named name: String, in lines: [String]) -> String? {
@@ -442,6 +484,14 @@ enum HTTPRequestParser {
         return value.split(separator: ":", maxSplits: 1).first.map { String($0).lowercased() }
     }
 
+    private static func contentLength(in lines: [String]) throws -> Int? {
+        guard let value = headerValue(named: "content-length", in: lines) else { return nil }
+        guard let contentLength = Int(value), contentLength >= 0 else {
+            throw CLIError("invalid Content-Length header")
+        }
+        return contentLength
+    }
+
     private static func portSuffix(_ port: Int?, scheme: String) -> String {
         guard let port else { return "" }
         return portSuffix(UInt16(port), scheme: scheme)
@@ -459,12 +509,94 @@ enum HTTPRequestParser {
 }
 
 struct HTTPRequestMutator {
+    private static let markerPrefix = Data("vzm:".utf8)
+
+    let secretStore: SecretStore
+
     func mutate(_ request: ParsedHTTPRequest) throws -> MutatedHTTPRequest {
-        MutatedHTTPRequest(bytes: request.bytes)
+        guard request.bytes.range(of: Self.markerPrefix) != nil else {
+            return MutatedHTTPRequest(request: request.request, bytes: request.bytes)
+        }
+        guard var text = String(data: request.bytes, encoding: .utf8) else {
+            throw CLIError("secret placeholder replacement requires UTF-8 HTTP request bytes")
+        }
+
+        let matches = Self.secretReferences(in: text)
+        guard !matches.isEmpty else {
+            return MutatedHTTPRequest(request: request.request, bytes: request.bytes)
+        }
+
+        let uniqueIDs = Array(Set(matches.map(\.id)))
+        let secrets = try uniqueIDs.map { try secretStore.get(id: $0) }
+        let secretsByID = Dictionary(uniqueKeysWithValues: secrets.map { ($0.id, $0) })
+        for secret in secrets {
+            guard secret.allows(host: request.request.host) else {
+                throw CLIError("secret '\(secret.name)' is not allowed for \(request.request.host)")
+            }
+        }
+        for match in matches.reversed() {
+            guard let secret = secretsByID[match.id] else { continue }
+            text.replaceSubrange(match.range, with: secret.value)
+        }
+
+        let updatedText = try updateContentLength(in: text, original: request)
+        guard let bytes = updatedText.data(using: .utf8) else {
+            throw CLIError("mutated HTTP request was not valid UTF-8")
+        }
+
+        let secretNames = Array(Set(secrets.map(\.name))).sorted()
+        let updatedRequest = HTTPSProxyRequest(
+            method: request.request.method,
+            scheme: request.request.scheme,
+            host: request.request.host,
+            port: request.request.port,
+            path: request.request.path,
+            url: request.request.url,
+            httpVersion: request.request.httpVersion,
+            secretNames: secretNames
+        )
+        return MutatedHTTPRequest(request: updatedRequest, bytes: bytes)
+    }
+
+    private func updateContentLength(in text: String, original request: ParsedHTTPRequest) throws -> String {
+        guard request.contentLength != nil else {
+            return text
+        }
+        guard let headerRange = text.range(of: "\r\n\r\n") else {
+            throw CLIError("mutated HTTP request headers were incomplete")
+        }
+
+        let body = text[headerRange.upperBound...]
+        let length = body.data(using: .utf8)?.count ?? body.utf8.count
+        let headers = String(text[..<headerRange.lowerBound])
+        let lines = headers.components(separatedBy: "\r\n")
+        let updatedLines = lines.map { line -> String in
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, parts[0].lowercased() == "content-length" else {
+                return line
+            }
+            return "\(parts[0]): \(length)"
+        }
+        return updatedLines.joined(separator: "\r\n") + "\r\n\r\n" + body
+    }
+
+    private static func secretReferences(in text: String) -> [(range: Range<String.Index>, id: UUID)] {
+        let pattern = #"vzm:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let fullRange = Range(match.range(at: 0), in: text),
+                  let uuidRange = Range(match.range(at: 1), in: text),
+                  let id = UUID(uuidString: String(text[uuidRange])) else {
+                return nil
+            }
+            return (range: fullRange, id: id)
+        }
     }
 }
 
 struct MutatedHTTPRequest {
+    let request: HTTPSProxyRequest
     let bytes: Data
 
     func write(to connection: NWConnection) throws {
