@@ -14,11 +14,11 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
     private var caConnections: [VZVirtioSocketConnection] = []
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
-    private weak var approvalController: HTTPSProxyApprovalController?
+    private weak var approvalController: ProxyApprovalController?
 
     init(
         socketDevice: VZVirtioSocketDevice,
-        approvalController: HTTPSProxyApprovalController?,
+        approvalController: ProxyApprovalController?,
         eventHandler: @escaping (String) -> Void
     ) throws {
         self.socketDevice = socketDevice
@@ -138,7 +138,7 @@ final class HTTPSProxySession: @unchecked Sendable {
     private let connection: VZVirtioSocketConnection
     private let caStore: ProxyCAStore
     private let policy: HTTPSProxyPolicy
-    private weak var approvalController: HTTPSProxyApprovalController?
+    private weak var approvalController: ProxyApprovalController?
     private let eventHandler: (String) -> Void
     private let onClose: (UUID) -> Void
     private var thread: Thread?
@@ -148,7 +148,7 @@ final class HTTPSProxySession: @unchecked Sendable {
         connection: VZVirtioSocketConnection,
         caStore: ProxyCAStore,
         policy: HTTPSProxyPolicy,
-        approvalController: HTTPSProxyApprovalController?,
+        approvalController: ProxyApprovalController?,
         eventHandler: @escaping (String) -> Void,
         onClose: @escaping (UUID) -> Void
     ) {
@@ -250,7 +250,7 @@ final class HTTPSProxySession: @unchecked Sendable {
             throw CLIError("https proxy approval UI unavailable for \(request.displayName)")
         }
 
-        let (requestID, decision) = approvalController.requestApproval(request: request)
+        let (requestID, decision) = approvalController.requestApproval(request: .https(request))
         switch decision {
         case .approve:
             eventHandler("https proxy approved \(request.displayName)")
@@ -803,6 +803,10 @@ final class RawFDRelay {
     func close() {
         _ = shutdown(leftFD, SHUT_RDWR)
         _ = shutdown(rightFD, SHUT_RDWR)
+        group.wait()
+    }
+
+    func wait() {
         group.wait()
     }
 

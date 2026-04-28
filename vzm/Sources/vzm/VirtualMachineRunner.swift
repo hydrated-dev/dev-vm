@@ -6,7 +6,7 @@ final class VirtualMachineRunner: NSObject {
     private let config: VMConfig
     private let bundle: ValidatedGuestBundle
     private let machineIdentifier: VZGenericMachineIdentifier
-    private weak var approvalController: HTTPSProxyApprovalController?
+    private weak var approvalController: ProxyApprovalController?
     private let eventHandler: (String) -> Void
     private let queue = DispatchQueue(label: "vzm.vm")
     private let signalQueue = DispatchQueue(label: "vzm.signal")
@@ -14,6 +14,7 @@ final class VirtualMachineRunner: NSObject {
     private var virtualMachine: VZVirtualMachine?
     private var bridge: SSHBridge?
     private var httpsProxy: HTTPSProxyManager?
+    private var outboundSSHProxy: OutboundSSHProxyManager?
     private var delegateRef: VMDelegate?
     private var sigintSource: DispatchSourceSignal?
     private var sigtermSource: DispatchSourceSignal?
@@ -26,7 +27,7 @@ final class VirtualMachineRunner: NSObject {
         config: VMConfig,
         bundle: ValidatedGuestBundle,
         machineIdentifier: VZGenericMachineIdentifier,
-        approvalController: HTTPSProxyApprovalController?,
+        approvalController: ProxyApprovalController?,
         eventHandler: @escaping (String) -> Void
     ) {
         self.config = config
@@ -54,6 +55,7 @@ final class VirtualMachineRunner: NSObject {
                     self?.eventHandler("guest stopped")
                 }
                 self?.httpsProxy?.stop()
+                self?.outboundSSHProxy?.stop()
                 self?.bridge?.stop()
                 self?.completionSemaphore.signal()
             }
@@ -90,6 +92,16 @@ final class VirtualMachineRunner: NSObject {
                             self.eventHandler("https proxy listening on vsock port \(Constants.hostHTTPSProxyVsockPort)")
                             self.eventHandler("https proxy allowlist: \(Constants.initialHTTPSProxyAllowlist.sorted().joined(separator: ", "))")
                             self.eventHandler("https request allowlist: \(Constants.initialHTTPSRequestAllowlist.sorted().joined(separator: ", "))")
+
+                            let outboundSSHProxy = OutboundSSHProxyManager(
+                                socketDevice: socketDevice,
+                                approvalController: self.approvalController,
+                                eventHandler: self.eventHandler
+                            )
+                            outboundSSHProxy.start()
+                            self.outboundSSHProxy = outboundSSHProxy
+                            self.eventHandler("outbound ssh proxy listening on vsock port \(Constants.hostOutboundSSHVsockPort)")
+                            self.eventHandler("outbound ssh proxy allowlist: \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort)")
 
                             let bridge = SSHBridge(
                                 socketDevice: socketDevice,
