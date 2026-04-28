@@ -8,48 +8,32 @@ enum ProxyApprovalDecision {
 }
 
 protocol HTTPSProxyApprovalController: AnyObject {
-    func requestApproval(host: String, port: UInt16) -> (UUID, ProxyApprovalDecision)
-    func updatePath(requestID: UUID, path: String)
+    func requestApproval(request: HTTPSProxyRequest) -> (UUID, ProxyApprovalDecision)
     func finishRequest(requestID: UUID)
     func cancelAllPendingRequests()
 }
 
 private final class PendingProxyApproval: @unchecked Sendable {
     let id = UUID()
-    let host: String
-    let port: UInt16
+    let request: HTTPSProxyRequest
     let requestedAt = Date()
     let semaphore = DispatchSemaphore(value: 0)
 
     private let lock = NSLock()
     private var storedDecision: ProxyApprovalDecision?
-    private var storedPath: String?
 
-    init(host: String, port: UInt16) {
-        self.host = host
-        self.port = port
+    init(request: HTTPSProxyRequest) {
+        self.request = request
     }
 
     var destination: String {
-        "\(host):\(port)"
-    }
-
-    var path: String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storedPath
+        request.displayName
     }
 
     var isResolved: Bool {
         lock.lock()
         defer { lock.unlock() }
         return storedDecision != nil
-    }
-
-    func setPath(_ path: String) {
-        lock.lock()
-        storedPath = path
-        lock.unlock()
     }
 
     func resolve(_ decision: ProxyApprovalDecision) {
@@ -80,7 +64,8 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
     private var orderedRequestIDs: [UUID] = []
     private var statusItem: NSStatusItem?
     private var currentItem: NSMenuItem?
-    private var pathItem: NSMenuItem?
+    private var urlItem: NSMenuItem?
+    private var protocolItem: NSMenuItem?
     private var approveItem: NSMenuItem?
     private var denyItem: NSMenuItem?
 
@@ -98,7 +83,8 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
 
         let menu = NSMenu()
         currentItem = NSMenuItem(title: "No pending HTTPS requests", action: nil, keyEquivalent: "")
-        pathItem = NSMenuItem(title: "Path: unavailable", action: nil, keyEquivalent: "")
+        urlItem = NSMenuItem(title: "URL: unavailable", action: nil, keyEquivalent: "")
+        protocolItem = NSMenuItem(title: "Protocol: unavailable", action: nil, keyEquivalent: "")
         approveItem = NSMenuItem(title: "Approve Current", action: #selector(approveCurrent), keyEquivalent: "a")
         denyItem = NSMenuItem(title: "Deny Current", action: #selector(denyCurrent), keyEquivalent: "d")
 
@@ -108,7 +94,8 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
         denyItem?.keyEquivalentModifierMask = [.command]
 
         menu.addItem(currentItem!)
-        menu.addItem(pathItem!)
+        menu.addItem(urlItem!)
+        menu.addItem(protocolItem!)
         menu.addItem(.separator())
         menu.addItem(approveItem!)
         menu.addItem(denyItem!)
@@ -133,14 +120,14 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
         }
     }
 
-    func requestApproval(host: String, port: UInt16) -> (UUID, ProxyApprovalDecision) {
-        let request = PendingProxyApproval(host: host, port: port)
+    func requestApproval(request proxyRequest: HTTPSProxyRequest) -> (UUID, ProxyApprovalDecision) {
+        let request = PendingProxyApproval(request: proxyRequest)
         lock.lock()
         pendingRequests[request.id] = request
         orderedRequestIDs.append(request.id)
         lock.unlock()
 
-        eventHandler("https proxy pending CONNECT \(request.destination)")
+        eventHandler("https proxy pending \(request.destination)")
         DispatchQueue.main.async { [weak self] in
             self?.refreshMenu()
         }
@@ -155,17 +142,6 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
             self?.refreshMenu()
         }
         return (request.id, decision)
-    }
-
-    func updatePath(requestID: UUID, path: String) {
-        lock.lock()
-        let request = pendingRequests[requestID]
-        lock.unlock()
-
-        request?.setPath(path)
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshMenu()
-        }
     }
 
     func finishRequest(requestID: UUID) {
@@ -235,14 +211,16 @@ final class MenuBarProxyApprovalController: NSObject, HTTPSProxyApprovalControll
             statusItem?.button?.title = count > 1 ? "vzm \(count)!" : (count == 1 ? "vzm !" : "vzm")
             currentItem?.title = request.isResolved ? "Approved: \(request.destination)" : "Pending: \(request.destination)"
             currentItem?.isEnabled = false
-            pathItem?.title = "Path: \(request.path ?? "unavailable")"
+            urlItem?.title = "URL: \(request.request.url)"
+            protocolItem?.title = "Protocol: \(request.request.httpVersion)"
             approveItem?.isEnabled = count > 0
             denyItem?.isEnabled = count > 0
         } else {
             statusItem?.button?.title = "vzm"
             currentItem?.title = "No pending HTTPS requests"
             currentItem?.isEnabled = false
-            pathItem?.title = "Path: unavailable"
+            urlItem?.title = "URL: unavailable"
+            protocolItem?.title = "Protocol: unavailable"
             approveItem?.isEnabled = false
             denyItem?.isEnabled = false
         }

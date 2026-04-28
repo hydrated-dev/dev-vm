@@ -95,13 +95,40 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
 
 struct HTTPSProxyPolicy {
     private let allowedDestinations: Set<String>
+    private let allowedRequests: Set<String>
 
-    init(allowedDestinations: Set<String>) {
+    init(
+        allowedDestinations: Set<String>,
+        allowedRequests: Set<String> = Constants.initialHTTPSRequestAllowlist
+    ) {
         self.allowedDestinations = allowedDestinations
+        self.allowedRequests = allowedRequests
     }
 
     func allows(host: String, port: UInt16) -> Bool {
         allowedDestinations.contains("\(host.lowercased()):\(port)")
+    }
+
+    func allows(request: HTTPSProxyRequest) -> Bool {
+        allowedRequests.contains(request.policyKey)
+    }
+}
+
+struct HTTPSProxyRequest: Sendable {
+    let method: String
+    let scheme: String
+    let host: String
+    let port: UInt16
+    let path: String
+    let url: String
+    let httpVersion: String
+
+    var policyKey: String {
+        "\(method.uppercased()) \(url)"
+    }
+
+    var displayName: String {
+        "\(method.uppercased()) \(url)"
     }
 }
 
@@ -153,19 +180,13 @@ final class HTTPSProxySession: @unchecked Sendable {
         let guestFD = connection.fileDescriptor
 
         do {
-            let request = try HTTPConnectRequest.read(from: guestFD)
-            let approvalRequestID = try approve(request)
-            defer {
-                if let approvalRequestID {
-                    approvalController?.finishRequest(requestID: approvalRequestID)
-                }
-            }
+            let connectRequest = try HTTPConnectRequest.read(from: guestFD)
 
             SocketSupport.writeAll("HTTP/1.1 200 Connection Established\r\n\r\n", to: guestFD)
-            eventHandler("https proxy allowed CONNECT \(request.host):\(request.port)")
+            eventHandler("https proxy accepted CONNECT \(connectRequest.host):\(connectRequest.port)")
 
-            let leafIdentity = try caStore.identity(for: request.host)
-            eventHandler("https proxy preparing guest TLS for \(request.host)")
+            let leafIdentity = try caStore.identity(for: connectRequest.host)
+            eventHandler("https proxy preparing guest TLS for \(connectRequest.host)")
             let guestTLS = try LoopbackTLSTerminator(identity: leafIdentity)
             defer { guestTLS.close() }
 
@@ -179,43 +200,89 @@ final class HTTPSProxySession: @unchecked Sendable {
             }
 
             let guestConnection = try guestTLS.acceptConnection()
-            eventHandler("https proxy guest TLS established for \(request.host)")
-            let upstreamConnection = try NetworkTLSConnection.connect(host: request.host, port: request.port)
-            eventHandler("https proxy upstream TLS established for \(request.host):\(request.port)")
-            let pathObserver = HTTPPathObserver { [weak self] path in
-                guard let approvalRequestID else { return }
-                self?.eventHandler("https proxy observed \(request.host) path \(path)")
-                self?.approvalController?.updatePath(requestID: approvalRequestID, path: path)
+            eventHandler("https proxy guest TLS established for \(connectRequest.host)")
+
+            let initialRequest: ParsedHTTPRequest
+            do {
+                initialRequest = try HTTPRequestParser.readFirstRequest(
+                    from: guestConnection,
+                    connectHost: connectRequest.host,
+                    connectPort: connectRequest.port
+                )
+            } catch {
+                let rejected = HTTPSProxyDeniedError(
+                    status: 505,
+                    reason: "HTTP Version Not Supported",
+                    message: error.localizedDescription
+                )
+                try? guestConnection.sendBlocking(rejected.responseData)
+                throw error
             }
-            try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection, leftToRightObserver: pathObserver.observe)
+            let approvalRequestID: UUID?
+            do {
+                approvalRequestID = try approve(initialRequest.request)
+            } catch let denied as HTTPSProxyDeniedError {
+                try? guestConnection.sendBlocking(denied.responseData)
+                throw denied
+            }
+            defer {
+                if let approvalRequestID {
+                    approvalController?.finishRequest(requestID: approvalRequestID)
+                }
+            }
+
+            let upstreamConnection = try NetworkTLSConnection.connect(host: connectRequest.host, port: connectRequest.port)
+            eventHandler("https proxy upstream TLS established for \(connectRequest.host):\(connectRequest.port)")
+            try HTTPRequestMutator().mutate(initialRequest).write(to: upstreamConnection)
+            try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection)
         } catch {
             eventHandler("https proxy session failed: \(error.localizedDescription)")
         }
     }
 
-    private func approve(_ request: HTTPConnectRequest) throws -> UUID? {
-        if policy.allows(host: request.host, port: request.port) {
+    private func approve(_ request: HTTPSProxyRequest) throws -> UUID? {
+        if policy.allows(request: request) || policy.allows(host: request.host, port: request.port) {
+            eventHandler("https proxy allowed \(request.displayName)")
             return nil
         }
 
         guard let approvalController else {
-            throw CLIError("https proxy approval UI unavailable for CONNECT \(request.host):\(request.port)")
+            throw CLIError("https proxy approval UI unavailable for \(request.displayName)")
         }
 
-        let (requestID, decision) = approvalController.requestApproval(host: request.host, port: request.port)
+        let (requestID, decision) = approvalController.requestApproval(request: request)
         switch decision {
         case .approve:
-            eventHandler("https proxy approved CONNECT \(request.host):\(request.port)")
+            eventHandler("https proxy approved \(request.displayName)")
             return requestID
         case .deny:
-            eventHandler("https proxy denied CONNECT \(request.host):\(request.port)")
-            SocketSupport.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", to: connection.fileDescriptor)
-            throw CLIError("CONNECT \(request.host):\(request.port) denied by user")
+            eventHandler("https proxy denied \(request.displayName)")
+            throw HTTPSProxyDeniedError(status: 403, reason: "Forbidden", message: "request denied by user")
         case .cancel:
-            eventHandler("https proxy cancelled CONNECT \(request.host):\(request.port)")
-            SocketSupport.writeAll("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", to: connection.fileDescriptor)
-            throw CLIError("CONNECT \(request.host):\(request.port) cancelled")
+            eventHandler("https proxy cancelled \(request.displayName)")
+            throw HTTPSProxyDeniedError(status: 503, reason: "Service Unavailable", message: "request cancelled")
         }
+    }
+}
+
+struct HTTPSProxyDeniedError: Error, LocalizedError {
+    let status: Int
+    let reason: String
+    let message: String
+
+    var errorDescription: String? {
+        message
+    }
+
+    var responseData: Data {
+        let body = "\(status) \(reason)\n"
+        var response = "HTTP/1.1 \(status) \(reason)\r\n"
+        response += "Content-Type: text/plain\r\n"
+        response += "Content-Length: \(body.utf8.count)\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        response += body
+        return Data(response.utf8)
     }
 }
 
@@ -262,6 +329,146 @@ struct HTTPConnectRequest {
             throw CLIError("CONNECT host contains unsupported characters")
         }
         return HTTPConnectRequest(host: host, port: port)
+    }
+}
+
+struct ParsedHTTPRequest {
+    let request: HTTPSProxyRequest
+    let bytes: Data
+}
+
+enum HTTPRequestParser {
+    static func readFirstRequest(
+        from connection: NWConnection,
+        connectHost: String,
+        connectPort: UInt16
+    ) throws -> ParsedHTTPRequest {
+        var data = Data()
+        let headerTerminator = Data([13, 10, 13, 10])
+
+        while data.count < 64 * 1024 {
+            guard let chunk = try connection.receiveBlocking(maxLength: 16 * 1024) else {
+                throw CLIError("guest closed TLS before sending HTTP request")
+            }
+            data.append(chunk)
+
+            if data.starts(with: Data("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8)) {
+                throw CLIError("guest attempted HTTP/2 despite proxy HTTP/1.1 ALPN")
+            }
+            if data.range(of: headerTerminator) != nil {
+                return try parse(data, connectHost: connectHost, connectPort: connectPort)
+            }
+        }
+
+        throw CLIError("HTTP request headers exceeded 64 KiB")
+    }
+
+    private static func parse(_ data: Data, connectHost: String, connectPort: UInt16) throws -> ParsedHTTPRequest {
+        guard let headerEnd = data.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
+            throw CLIError("HTTP request headers were incomplete")
+        }
+        let headerBytes = data.prefix(upTo: headerEnd)
+        guard let headerText = String(data: headerBytes, encoding: .utf8) else {
+            throw CLIError("HTTP request headers were not valid UTF-8")
+        }
+
+        let lines = headerText.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first, !requestLine.isEmpty else {
+            throw CLIError("HTTP request line was empty")
+        }
+
+        let parts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
+        guard parts.count == 3 else {
+            throw CLIError("HTTP request line was malformed")
+        }
+
+        let method = parts[0].uppercased()
+        let target = parts[1]
+        let version = parts[2].uppercased()
+        guard version == "HTTP/1.1" else {
+            throw CLIError("proxy only supports HTTP/1.1 after TLS, got \(parts[2])")
+        }
+
+        let hostHeader = headerValue(named: "host", in: lines)
+        var requestHost = normalizedHost(hostHeader) ?? connectHost
+        var requestPort = connectPort
+        var scheme = "https"
+        let path: String
+        let url: String
+
+        if target.lowercased().hasPrefix("https://") || target.lowercased().hasPrefix("http://") {
+            guard let components = URLComponents(string: target), let parsedHost = components.host else {
+                throw CLIError("absolute HTTP request target was not a valid URL")
+            }
+            scheme = components.scheme?.lowercased() ?? "https"
+            requestHost = parsedHost.lowercased()
+            requestPort = UInt16(components.port ?? (scheme == "https" ? 443 : 80))
+            let encodedPath = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+            path = encodedPath + (components.percentEncodedQuery.map { "?\($0)" } ?? "")
+            url = "\(scheme)://\(requestHost)\(portSuffix(requestPort, scheme: scheme))\(path)"
+        } else if target.hasPrefix("/") {
+            path = target
+            url = "https://\(requestHost)\(portSuffix(requestPort, scheme: "https"))\(path)"
+        } else {
+            throw CLIError("HTTP request target must be origin-form or absolute-form")
+        }
+
+        let request = HTTPSProxyRequest(
+            method: method,
+            scheme: scheme,
+            host: requestHost.lowercased(),
+            port: requestPort,
+            path: path,
+            url: url,
+            httpVersion: version
+        )
+        return ParsedHTTPRequest(request: request, bytes: data)
+    }
+
+    private static func headerValue(named name: String, in lines: [String]) -> String? {
+        for line in lines.dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, parts[0].lowercased() == name else { continue }
+            return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private static func normalizedHost(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        if value.hasPrefix("[") {
+            return value
+        }
+        return value.split(separator: ":", maxSplits: 1).first.map { String($0).lowercased() }
+    }
+
+    private static func portSuffix(_ port: Int?, scheme: String) -> String {
+        guard let port else { return "" }
+        return portSuffix(UInt16(port), scheme: scheme)
+    }
+
+    private static func portSuffix(_ port: UInt16, scheme: String) -> String {
+        if scheme == "https", port == 443 {
+            return ""
+        }
+        if scheme == "http", port == 80 {
+            return ""
+        }
+        return ":\(port)"
+    }
+}
+
+struct HTTPRequestMutator {
+    func mutate(_ request: ParsedHTTPRequest) throws -> MutatedHTTPRequest {
+        MutatedHTTPRequest(bytes: request.bytes)
+    }
+}
+
+struct MutatedHTTPRequest {
+    let bytes: Data
+
+    func write(to connection: NWConnection) throws {
+        try connection.sendBlocking(bytes)
     }
 }
 
@@ -432,6 +639,7 @@ final class LoopbackTLSTerminator {
         }
         sec_protocol_options_set_local_identity(tlsOptions.securityProtocolOptions, securityIdentity)
         sec_protocol_options_set_peer_authentication_required(tlsOptions.securityProtocolOptions, false)
+        TLSOptions.forceHTTP11(tlsOptions)
 
         let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
         parameters.acceptLocalOnly = true
@@ -489,6 +697,7 @@ enum NetworkTLSConnection {
     static func connect(host: String, port: UInt16) throws -> NWConnection {
         let tlsOptions = NWProtocolTLS.Options()
         sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, host)
+        TLSOptions.forceHTTP11(tlsOptions)
         let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
         parameters.preferNoProxies = true
 
@@ -502,12 +711,16 @@ enum NetworkTLSConnection {
     }
 }
 
+enum TLSOptions {
+    static func forceHTTP11(_ options: NWProtocolTLS.Options) {
+        "http/1.1".withCString { protocolName in
+            sec_protocol_options_add_tls_application_protocol(options.securityProtocolOptions, protocolName)
+        }
+    }
+}
+
 enum NetworkConnectionRelay {
-    static func relay(
-        left: NWConnection,
-        right: NWConnection,
-        leftToRightObserver: (@Sendable (Data) -> Void)? = nil
-    ) throws {
+    static func relay(left: NWConnection, right: NWConnection) throws {
         let group = DispatchGroup()
         let errors = RelayErrorBox()
 
@@ -523,7 +736,7 @@ enum NetworkConnectionRelay {
                 right.cancel()
             }
             do {
-                try pump(from: left, to: right, observer: leftToRightObserver)
+                try pump(from: left, to: right)
             } catch {
                 record(error)
             }
@@ -549,67 +762,12 @@ enum NetworkConnectionRelay {
         }
     }
 
-    private static func pump(
-        from source: NWConnection,
-        to destination: NWConnection,
-        observer: (@Sendable (Data) -> Void)? = nil
-    ) throws {
+    private static func pump(from source: NWConnection, to destination: NWConnection) throws {
         while true {
             guard let data = try source.receiveBlocking(maxLength: 16 * 1024) else {
                 return
             }
-            observer?(data)
             try destination.sendBlocking(data)
-        }
-    }
-}
-
-final class HTTPPathObserver: @unchecked Sendable {
-    private let lock = NSLock()
-    private let onPath: @Sendable (String) -> Void
-    private var buffer = Data()
-    private var didResolve = false
-
-    init(onPath: @escaping @Sendable (String) -> Void) {
-        self.onPath = onPath
-    }
-
-    func observe(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard !didResolve else { return }
-        buffer.append(data)
-
-        if buffer.starts(with: Data("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8)) {
-            didResolve = true
-            onPath("unavailable (HTTP/2)")
-            return
-        }
-
-        guard let headerEnd = buffer.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
-            if buffer.count > 16 * 1024 {
-                didResolve = true
-                onPath("unavailable")
-            }
-            return
-        }
-
-        let header = buffer.prefix(upTo: headerEnd)
-        guard let text = String(data: header, encoding: .utf8),
-              let requestLine = text.split(separator: "\r\n", maxSplits: 1).first else {
-            didResolve = true
-            onPath("unavailable")
-            return
-        }
-
-        let parts = requestLine.split(separator: " ")
-        if parts.count >= 2 {
-            didResolve = true
-            onPath(String(parts[1]))
-        } else {
-            didResolve = true
-            onPath("unavailable")
         }
     }
 }

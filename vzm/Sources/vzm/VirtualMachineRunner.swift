@@ -89,6 +89,7 @@ final class VirtualMachineRunner: NSObject {
                             self.httpsProxy = proxy
                             self.eventHandler("https proxy listening on vsock port \(Constants.hostHTTPSProxyVsockPort)")
                             self.eventHandler("https proxy allowlist: \(Constants.initialHTTPSProxyAllowlist.sorted().joined(separator: ", "))")
+                            self.eventHandler("https request allowlist: \(Constants.initialHTTPSRequestAllowlist.sorted().joined(separator: ", "))")
 
                             let bridge = SSHBridge(
                                 socketDevice: socketDevice,
