@@ -5,6 +5,9 @@ enum Constants {
     static let configSchemaVersion = 3
     static let bundleSchemaVersion = 1
     static let guestSSHVsockPort: UInt32 = 22
+    static let hostHTTPSProxyVsockPort: UInt32 = 3128
+    static let hostHTTPSProxyCAPort: UInt32 = 3129
+    static let initialHTTPSProxyAllowlist: Set<String> = ["google.com:443"]
     static let defaultMemoryBytes: UInt64 = 4 * 1024 * 1024 * 1024
     static let defaultCPUCount = 2
     static let shutdownTimeoutSeconds: TimeInterval = 30
