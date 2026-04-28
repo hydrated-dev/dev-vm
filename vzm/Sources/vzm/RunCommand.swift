@@ -29,7 +29,9 @@ struct RunCommand {
         }
 
         let approvalController = MenuBarProxyApprovalController(eventHandler: eventHandler)
-        approvalController.start()
+        MainActor.assumeIsolated {
+            approvalController.start()
+        }
 
         let runner = VirtualMachineRunner(
             config: config,
@@ -50,20 +52,23 @@ struct RunCommand {
                 runError.set(error)
             }
 
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 approvalController.stop()
                 NSApplication.shared.stop(nil)
                 Self.wakeApplicationEventLoop()
             }
         }
 
-        NSApplication.shared.run()
+        MainActor.assumeIsolated {
+            NSApplication.shared.run()
+        }
 
         if let error = runError.value {
             throw error
         }
     }
 
+    @MainActor
     private static func wakeApplicationEventLoop() {
         guard let event = NSEvent.otherEvent(
             with: .applicationDefined,

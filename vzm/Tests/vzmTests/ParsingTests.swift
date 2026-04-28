@@ -1,0 +1,46 @@
+import Foundation
+import XCTest
+@testable import vzm
+
+final class ParsingTests: XCTestCase {
+    func testDiskSizeParsesBinarySuffixes() throws {
+        XCTAssertEqual(try DiskSize(argument: "1k").bytes, 1024)
+        XCTAssertEqual(try DiskSize(argument: "2m").bytes, 2 * 1024 * 1024)
+        XCTAssertEqual(try DiskSize(argument: "3g").bytes, 3 * 1024 * 1024 * 1024)
+    }
+
+    func testConnectRequestParsesAuthority() throws {
+        let request = try HTTPConnectRequest.parse(header: "CONNECT Example.COM:443 HTTP/1.1\r\nHost: Example.COM:443\r\n\r\n")
+        XCTAssertEqual(request.host, "example.com")
+        XCTAssertEqual(request.port, 443)
+    }
+
+    func testHTTPRequestParserHandlesOriginForm() throws {
+        let data = Data("GET /path?q=1 HTTP/1.1\r\nHost: Example.COM\r\n\r\n".utf8)
+        let parsed = try HTTPRequestParser.parse(data, connectHost: "example.com", connectPort: 443)
+
+        XCTAssertEqual(parsed.request.method, "GET")
+        XCTAssertEqual(parsed.request.host, "example.com")
+        XCTAssertEqual(parsed.request.port, 443)
+        XCTAssertEqual(parsed.request.path, "/path?q=1")
+        XCTAssertEqual(parsed.request.url, "https://example.com/path?q=1")
+    }
+
+    func testHTTPRequestParserHandlesAbsoluteForm() throws {
+        let data = Data("POST https://Example.COM:8443/api HTTP/1.1\r\nHost: ignored.test\r\nContent-Length: 4\r\n\r\nbody".utf8)
+        let parsed = try HTTPRequestParser.parse(data, connectHost: "ignored.test", connectPort: 443)
+
+        XCTAssertEqual(parsed.request.method, "POST")
+        XCTAssertEqual(parsed.request.host, "example.com")
+        XCTAssertEqual(parsed.request.port, 8443)
+        XCTAssertEqual(parsed.request.url, "https://example.com:8443/api")
+        XCTAssertEqual(parsed.contentLength, 4)
+    }
+
+    func testSecretReferenceDetection() throws {
+        let id = UUID()
+        let references = HTTPRequestMutator.secretReferences(in: "Authorization: Bearer vzm:\(id.uuidString)")
+
+        XCTAssertEqual(references.map(\.id), [id])
+    }
+}

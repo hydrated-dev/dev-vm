@@ -1,8 +1,8 @@
 import Foundation
 import Darwin
-import Virtualization
+@preconcurrency import Virtualization
 
-final class SSHBridge: NSObject {
+final class SSHBridge: NSObject, @unchecked Sendable {
     private let socketDevice: VZVirtioSocketDevice
     private let virtualMachineQueue: DispatchQueue
     private let hostPort: UInt16
@@ -10,7 +10,7 @@ final class SSHBridge: NSObject {
     private let stateQueue = DispatchQueue(label: "vzm.ssh-bridge")
     private var listenerFD: Int32 = -1
     private var listenerSource: DispatchSourceRead?
-    private var sessions: [UUID: BridgeSession] = [:]
+    private let sessions = VsockSessionRegistry<BridgeSession>()
 
     init(
         socketDevice: VZVirtioSocketDevice,
@@ -43,8 +43,7 @@ final class SSHBridge: NSObject {
         stateQueue.sync {
             listenerSource?.cancel()
             listenerSource = nil
-            sessions.values.forEach { $0.close() }
-            sessions.removeAll()
+            sessions.closeAll()
         }
     }
 
@@ -80,28 +79,26 @@ final class SSHBridge: NSObject {
                     return
                 }
 
-                self.socketDevice.connect(toPort: Constants.guestSSHVsockPort) { [weak self] result in
-                    guard let self else {
-                        SocketSupport.closeQuietly(hostFD)
-                        return
-                    }
-
-                    self.stateQueue.async {
-                        switch result {
+                let sessions = self.sessions
+                let stateQueue = self.stateQueue
+                let eventHandler = UncheckedSendableBox(self.eventHandler)
+                self.socketDevice.connect(toPort: Constants.guestSSHVsockPort) { result in
+                    let resultBox = UncheckedSendableBox(result)
+                    stateQueue.async {
+                        switch resultBox.value {
                         case .success(let connection):
                             let session = BridgeSession(
                                 hostFD: hostFD,
                                 guestConnection: connection
-                            ) { [weak self] identifier in
-                                self?.stateQueue.async {
-                                    self?.sessions.removeValue(forKey: identifier)
+                            ) { identifier in
+                                stateQueue.async {
+                                    sessions.remove(id: identifier)
                                 }
                             }
-                            self.sessions[session.id] = session
-                            session.start()
+                            sessions.insertAndStart(session)
                         case .failure(let error):
                             SocketSupport.closeQuietly(hostFD)
-                            self.eventHandler("ssh forwarding connection failed: \(error.localizedDescription)")
+                            eventHandler.value("ssh forwarding connection failed: \(error.localizedDescription)")
                         }
                     }
                 }
@@ -110,7 +107,7 @@ final class SSHBridge: NSObject {
     }
 }
 
-final class BridgeSession {
+final class BridgeSession: ManagedSession, @unchecked Sendable {
     let id = UUID()
 
     private let hostFD: Int32

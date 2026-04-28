@@ -2,7 +2,7 @@ import Foundation
 import Dispatch
 @preconcurrency import Virtualization
 
-final class VirtualMachineRunner: NSObject {
+final class VirtualMachineRunner: NSObject, @unchecked Sendable {
     private let config: VMConfig
     private let bundle: ValidatedGuestBundle
     private let machineIdentifier: VZGenericMachineIdentifier
@@ -12,9 +12,7 @@ final class VirtualMachineRunner: NSObject {
     private let signalQueue = DispatchQueue(label: "vzm.signal")
 
     private var virtualMachine: VZVirtualMachine?
-    private var bridge: SSHBridge?
-    private var httpsProxy: HTTPSProxyManager?
-    private var outboundSSHProxy: OutboundSSHProxyManager?
+    private var guestServices: GuestServiceStack?
     private var delegateRef: VMDelegate?
     private var sigintSource: DispatchSourceSignal?
     private var sigtermSource: DispatchSourceSignal?
@@ -54,9 +52,7 @@ final class VirtualMachineRunner: NSObject {
                 } else {
                     self?.eventHandler("guest stopped")
                 }
-                self?.httpsProxy?.stop()
-                self?.outboundSSHProxy?.stop()
-                self?.bridge?.stop()
+                self?.guestServices?.stop()
                 self?.completionSemaphore.signal()
             }
         )
@@ -72,46 +68,26 @@ final class VirtualMachineRunner: NSObject {
         eventHandler("starting virtual machine")
 
         let startSemaphore = DispatchSemaphore(value: 0)
+        let virtualMachineBox = UncheckedSendableBox(virtualMachine)
         queue.async { [weak self] in
-            virtualMachine.start { result in
+            virtualMachineBox.value.start { result in
                 switch result {
                 case .success:
                     guard let self else {
                         startSemaphore.signal()
                         return
                     }
-                    if let socketDevice = virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
+                    if let socketDevice = virtualMachineBox.value.socketDevices.first as? VZVirtioSocketDevice {
                         do {
-                            let proxy = try HTTPSProxyManager(
-                                socketDevice: socketDevice,
-                                approvalController: self.approvalController,
-                                eventHandler: self.eventHandler
-                            )
-                            proxy.start()
-                            self.httpsProxy = proxy
-                            self.eventHandler("https proxy listening on vsock port \(Constants.hostHTTPSProxyVsockPort)")
-                            self.eventHandler("https proxy allowlist: \(Constants.initialHTTPSProxyAllowlist.sorted().joined(separator: ", "))")
-                            self.eventHandler("https request allowlist: \(Constants.initialHTTPSRequestAllowlist.sorted().joined(separator: ", "))")
-
-                            let outboundSSHProxy = OutboundSSHProxyManager(
-                                socketDevice: socketDevice,
-                                approvalController: self.approvalController,
-                                eventHandler: self.eventHandler
-                            )
-                            outboundSSHProxy.start()
-                            self.outboundSSHProxy = outboundSSHProxy
-                            self.eventHandler("outbound ssh proxy listening on vsock port \(Constants.hostOutboundSSHVsockPort)")
-                            self.eventHandler("outbound ssh proxy allowlist: \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort)")
-
-                            let bridge = SSHBridge(
+                            let guestServices = GuestServiceStack(
                                 socketDevice: socketDevice,
                                 virtualMachineQueue: self.queue,
-                                hostPort: self.config.hostSSHPort,
+                                config: self.config,
+                                approvalController: self.approvalController,
                                 eventHandler: self.eventHandler
                             )
-                            try bridge.start()
-                            self.bridge = bridge
-                            self.eventHandler("ssh bridge listening on 127.0.0.1:\(self.config.hostSSHPort)")
+                            try guestServices.start()
+                            self.guestServices = guestServices
                         } catch {
                             self.exitError = error
                             self.eventHandler("startup failure: \(error.localizedDescription)")

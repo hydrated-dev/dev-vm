@@ -8,7 +8,7 @@ final class OutboundSSHProxyManager: NSObject, VZVirtioSocketListenerDelegate, @
     private let eventHandler: (String) -> Void
     private let stateQueue = DispatchQueue(label: "vzm.outbound-ssh-proxy")
     private let listener = VZVirtioSocketListener()
-    private var sessions: [UUID: OutboundSSHProxySession] = [:]
+    private let sessions = VsockSessionRegistry<OutboundSSHProxySession>()
 
     init(
         socketDevice: VZVirtioSocketDevice,
@@ -29,8 +29,7 @@ final class OutboundSSHProxyManager: NSObject, VZVirtioSocketListenerDelegate, @
     func stop() {
         socketDevice.removeSocketListener(forPort: Constants.hostOutboundSSHVsockPort)
         stateQueue.sync {
-            sessions.values.forEach { $0.close() }
-            sessions.removeAll()
+            sessions.closeAll()
         }
     }
 
@@ -39,29 +38,31 @@ final class OutboundSSHProxyManager: NSObject, VZVirtioSocketListenerDelegate, @
         shouldAcceptNewConnection connection: VZVirtioSocketConnection,
         from socketDevice: VZVirtioSocketDevice
     ) -> Bool {
-        stateQueue.async { [weak self] in
+        let connectionBox = UncheckedSendableBox(connection)
+        stateQueue.async { [weak self, connectionBox] in
             guard let self else {
-                connection.close()
+                connectionBox.value.close()
                 return
             }
 
+            let sessions = self.sessions
+            let stateQueue = self.stateQueue
             let session = OutboundSSHProxySession(
-                connection: connection,
+                connection: connectionBox.value,
                 approvalController: self.approvalController,
                 eventHandler: self.eventHandler
-            ) { [weak self] id in
-                self?.stateQueue.async {
-                    self?.sessions.removeValue(forKey: id)
+            ) { id in
+                stateQueue.async {
+                    sessions.remove(id: id)
                 }
             }
-            self.sessions[session.id] = session
-            session.start()
+            sessions.insertAndStart(session)
         }
         return true
     }
 }
 
-final class OutboundSSHProxySession: @unchecked Sendable {
+final class OutboundSSHProxySession: ManagedSession, @unchecked Sendable {
     let id = UUID()
 
     private let connection: VZVirtioSocketConnection
@@ -129,21 +130,12 @@ final class OutboundSSHProxySession: @unchecked Sendable {
     }
 
     private func approve(_ request: ProxyApprovalRequest) throws -> UUID {
-        guard let approvalController else {
-            throw CLIError("outbound ssh approval UI unavailable for \(request.destination)")
-        }
-
-        let (requestID, decision) = approvalController.requestApproval(request: request)
-        switch decision {
-        case .approve:
-            eventHandler("outbound ssh proxy approved \(request.destination)")
-            return requestID
-        case .deny:
-            eventHandler("outbound ssh proxy denied \(request.destination)")
-            throw CLIError("outbound ssh request denied by user")
-        case .cancel:
-            eventHandler("outbound ssh proxy cancelled \(request.destination)")
-            throw CLIError("outbound ssh request cancelled")
-        }
+        try ProxyApprovalGate(controller: approvalController, eventHandler: eventHandler)
+            .requireApproval(
+                request: request,
+                logPrefix: "outbound ssh proxy",
+                deniedError: CLIError("outbound ssh request denied by user"),
+                cancelledError: CLIError("outbound ssh request cancelled")
+            )
     }
 }

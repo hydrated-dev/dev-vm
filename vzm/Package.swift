@@ -20,5 +20,9 @@ let package = Package(
                 .linkedFramework("Carbon"),
             ]
         ),
+        .testTarget(
+            name: "vzmTests",
+            dependencies: ["vzm"]
+        ),
     ]
 )

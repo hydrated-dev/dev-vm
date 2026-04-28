@@ -137,6 +137,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         super.init()
     }
 
+    @MainActor
     func start() {
         precondition(Thread.isMainThread)
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -177,7 +178,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
 
     func stop() {
         cancelAllPendingRequests()
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self, let statusItem = self.statusItem else { return }
             self.hotKeys?.stop()
             self.hotKeys = nil
@@ -199,7 +200,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         case .ssh:
             eventHandler("outbound ssh proxy pending \(request.destination)")
         }
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             self?.refreshMenu()
         }
 
@@ -209,7 +210,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
             removeRequest(id: request.id)
         }
 
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             self?.refreshMenu()
         }
         return (request.id, decision)
@@ -217,7 +218,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
 
     func finishRequest(requestID: UUID) {
         removeRequest(id: requestID)
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             self?.refreshMenu()
         }
     }
@@ -229,25 +230,33 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         requests.forEach { $0.resolve(.cancel) }
     }
 
+    @MainActor
     @objc private func approveCurrent() {
         resolveCurrent(.approve)
     }
 
+    @MainActor
     @objc private func denyCurrent() {
         resolveCurrent(.deny)
     }
 
+    @MainActor
     @objc private func stopVM() {
         stopRequested?()
     }
 
+    @MainActor
     private func installHotKeys() {
         let hotKeys = ProxyApprovalHotKeys(
             approve: { [weak self] in
-                self?.resolveCurrent(.approve)
+                Task { @MainActor in
+                    self?.resolveCurrent(.approve)
+                }
             },
             deny: { [weak self] in
-                self?.resolveCurrent(.deny)
+                Task { @MainActor in
+                    self?.resolveCurrent(.deny)
+                }
             }
         )
 
@@ -259,6 +268,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         }
     }
 
+    @MainActor
     private func resolveCurrent(_ decision: ProxyApprovalDecision) {
         guard let request = currentRequest() else { return }
         request.resolve(decision)
@@ -266,13 +276,6 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     }
 
     private func currentRequest() -> PendingProxyApproval? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let id = orderedRequestIDs.first(where: { pendingRequests[$0]?.isResolved == false }) else { return nil }
-        return pendingRequests[id]
-    }
-
-    private func visibleRequest() -> PendingProxyApproval? {
         lock.lock()
         defer { lock.unlock() }
         guard let id = orderedRequestIDs.first(where: { pendingRequests[$0]?.isResolved == false }) else { return nil }
@@ -292,9 +295,10 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         lock.unlock()
     }
 
+    @MainActor
     private func refreshMenu() {
         precondition(Thread.isMainThread)
-        let request = visibleRequest()
+        let request = currentRequest()
         let count = pendingCount()
 
         if let request {
