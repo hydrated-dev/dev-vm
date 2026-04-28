@@ -1,4 +1,5 @@
 @preconcurrency import AppKit
+import Carbon
 import Foundation
 
 enum ProxyApprovalDecision {
@@ -37,6 +38,28 @@ struct ProxyApprovalRequest: Sendable {
             detail: "Destination: \(host):\(port)",
             protocolName: "SSH"
         )
+    }
+
+    var menuBarTitle: String {
+        switch kind {
+        case .https:
+            return "HTTPS \(abbreviatedHTTPSDestination())"
+        case .ssh:
+            return "SSH \(destination)"
+        }
+    }
+
+    private func abbreviatedHTTPSDestination() -> String {
+        guard let components = URLComponents(string: destination), let host = components.host else {
+            return destination.truncatedForMenuBar(maxLength: 42)
+        }
+
+        let path = components.percentEncodedPath
+        guard !path.isEmpty, path != "/" else {
+            return host
+        }
+
+        return "\(host)\(path)".truncatedForMenuBar(maxLength: 42)
     }
 }
 
@@ -101,6 +124,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     private var protocolItem: NSMenuItem?
     private var approveItem: NSMenuItem?
     private var denyItem: NSMenuItem?
+    private var hotKeys: ProxyApprovalHotKeys?
 
     init(eventHandler: @escaping (String) -> Void) {
         self.eventHandler = eventHandler
@@ -118,8 +142,8 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         currentItem = NSMenuItem(title: "No pending proxy requests", action: nil, keyEquivalent: "")
         urlItem = NSMenuItem(title: "Detail: unavailable", action: nil, keyEquivalent: "")
         protocolItem = NSMenuItem(title: "Protocol: unavailable", action: nil, keyEquivalent: "")
-        approveItem = NSMenuItem(title: "Approve Current", action: #selector(approveCurrent), keyEquivalent: "a")
-        denyItem = NSMenuItem(title: "Deny Current", action: #selector(denyCurrent), keyEquivalent: "d")
+        approveItem = NSMenuItem(title: "Approve Current (Cmd+Shift+9)", action: #selector(approveCurrent), keyEquivalent: "a")
+        denyItem = NSMenuItem(title: "Deny Current (Cmd+Shift+0)", action: #selector(denyCurrent), keyEquivalent: "d")
 
         approveItem?.target = self
         denyItem?.target = self
@@ -141,6 +165,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
 
         statusItem.menu = menu
         self.statusItem = statusItem
+        installHotKeys()
         refreshMenu()
     }
 
@@ -148,6 +173,8 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         cancelAllPendingRequests()
         DispatchQueue.main.async { [weak self] in
             guard let self, let statusItem = self.statusItem else { return }
+            self.hotKeys?.stop()
+            self.hotKeys = nil
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
         }
@@ -208,9 +235,28 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         stopRequested?()
     }
 
+    private func installHotKeys() {
+        let hotKeys = ProxyApprovalHotKeys(
+            approve: { [weak self] in
+                self?.resolveCurrent(.approve)
+            },
+            deny: { [weak self] in
+                self?.resolveCurrent(.deny)
+            }
+        )
+
+        do {
+            try hotKeys.start()
+            self.hotKeys = hotKeys
+        } catch {
+            eventHandler("proxy approval global hotkeys unavailable: \(error)")
+        }
+    }
+
     private func resolveCurrent(_ decision: ProxyApprovalDecision) {
         guard let request = currentRequest() else { return }
         request.resolve(decision)
+        refreshMenu()
     }
 
     private func currentRequest() -> PendingProxyApproval? {
@@ -223,7 +269,7 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     private func visibleRequest() -> PendingProxyApproval? {
         lock.lock()
         defer { lock.unlock() }
-        guard let id = orderedRequestIDs.first else { return nil }
+        guard let id = orderedRequestIDs.first(where: { pendingRequests[$0]?.isResolved == false }) else { return nil }
         return pendingRequests[id]
     }
 
@@ -246,8 +292,9 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         let count = pendingCount()
 
         if let request {
-            statusItem?.button?.title = count > 1 ? "vzm \(count)!" : (count == 1 ? "vzm !" : "vzm")
-            currentItem?.title = request.isResolved ? "Approved: \(request.destination)" : "Pending: \(request.destination)"
+            let countPrefix = count > 1 ? "(\(count)) " : ""
+            statusItem?.button?.title = "vzm \(countPrefix)\(request.request.menuBarTitle)"
+            currentItem?.title = "Pending: \(request.destination)"
             currentItem?.isEnabled = false
             urlItem?.title = request.request.detail
             protocolItem?.title = "Protocol: \(request.request.protocolName)"
@@ -262,5 +309,125 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
             approveItem?.isEnabled = false
             denyItem?.isEnabled = false
         }
+    }
+}
+
+private final class ProxyApprovalHotKeys: @unchecked Sendable {
+    private enum HotKeyID: UInt32, Sendable {
+        case approve = 1
+        case deny = 2
+    }
+
+    private let approve: @Sendable () -> Void
+    private let deny: @Sendable () -> Void
+    private var handlerRef: EventHandlerRef?
+    private var hotKeyRefs: [EventHotKeyRef] = []
+
+    init(approve: @escaping @Sendable () -> Void, deny: @escaping @Sendable () -> Void) {
+        self.approve = approve
+        self.deny = deny
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() throws {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let installStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                guard let event, let userData else {
+                    return OSStatus(eventNotHandledErr)
+                }
+
+                var hotKeyID = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKeyID
+                )
+                guard status == noErr else {
+                    return status
+                }
+
+                let hotKeys = Unmanaged<ProxyApprovalHotKeys>.fromOpaque(userData).takeUnretainedValue()
+                hotKeys.handle(id: hotKeyID.id)
+                return noErr
+            },
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &handlerRef
+        )
+        guard installStatus == noErr else {
+            throw CLIError("failed to install hotkey handler: \(installStatus)")
+        }
+
+        do {
+            try register(keyCode: UInt32(kVK_ANSI_9), modifiers: UInt32(cmdKey | shiftKey), id: .approve)
+            try register(keyCode: UInt32(kVK_ANSI_0), modifiers: UInt32(cmdKey | shiftKey), id: .deny)
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    func stop() {
+        hotKeyRefs.forEach { UnregisterEventHotKey($0) }
+        hotKeyRefs.removeAll()
+
+        if let handlerRef {
+            RemoveEventHandler(handlerRef)
+            self.handlerRef = nil
+        }
+    }
+
+    private func register(keyCode: UInt32, modifiers: UInt32, id: HotKeyID) throws {
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: id.rawValue)
+        var hotKeyRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            keyCode,
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+        guard status == noErr, let hotKeyRef else {
+            let keyName = id == .approve ? "9" : "0"
+            throw CLIError("failed to register Cmd+Shift+\(keyName): \(status)")
+        }
+        hotKeyRefs.append(hotKeyRef)
+    }
+
+    private func handle(id: UInt32) {
+        guard let hotKeyID = HotKeyID(rawValue: id) else { return }
+        DispatchQueue.main.async { [approve, deny] in
+            switch hotKeyID {
+            case .approve:
+                approve()
+            case .deny:
+                deny()
+            }
+        }
+    }
+
+    private static let signature: OSType = fourCharCode("vzmA")
+
+    private static func fourCharCode(_ string: String) -> OSType {
+        string.utf8.reduce(0) { ($0 << 8) + OSType($1) }
+    }
+}
+
+private extension String {
+    func truncatedForMenuBar(maxLength: Int) -> String {
+        guard count > maxLength, maxLength > 3 else { return self }
+        let endIndex = index(startIndex, offsetBy: maxLength - 3)
+        return "\(self[..<endIndex])..."
     }
 }
