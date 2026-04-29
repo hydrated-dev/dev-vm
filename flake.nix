@@ -27,7 +27,6 @@
 
       kernelCommandLine = nixpkgs.lib.concatStringsSep " " (
         [
-          "console=hvc0"
           "root=LABEL=vzm-root"
           "rootfstype=ext4"
           "init=${vm.config.system.build.toplevel}/init"
