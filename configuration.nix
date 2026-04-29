@@ -162,6 +162,28 @@
     };
   };
 
+  systemd.services.vzm-port-forward-3000 = {
+    description = "Expose guest localhost:3000 over vsock";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-modules-load.service" "network.target" ];
+    serviceConfig = {
+      ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:3000,fork,reuseaddr TCP:127.0.0.1:3000";
+      Restart = "always";
+      RestartSec = "1s";
+    };
+  };
+
+  systemd.services.vzm-port-forward-5173 = {
+    description = "Expose guest localhost:5173 over vsock";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-modules-load.service" "network.target" ];
+    serviceConfig = {
+      ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:5173,fork,reuseaddr TCP:127.0.0.1:5173";
+      Restart = "always";
+      RestartSec = "1s";
+    };
+  };
+
   programs.zsh.enable = true;
   users.defaultUserShell = pkgs.zsh;
 

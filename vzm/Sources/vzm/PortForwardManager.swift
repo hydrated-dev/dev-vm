@@ -4,7 +4,6 @@ import Foundation
 final class PortForwardManager: @unchecked Sendable {
     private let socketDevice: VZVirtioSocketDevice
     private let virtualMachineQueue: DispatchQueue
-    private let guestControl: GuestPortForwardControl
     private let eventHandler: (String) -> Void
     private let stateQueue = DispatchQueue(label: "vzm.port-forward-manager")
     private var activeForwards: [UInt16: TCPToVsockPortForward] = [:]
@@ -12,12 +11,10 @@ final class PortForwardManager: @unchecked Sendable {
     init(
         socketDevice: VZVirtioSocketDevice,
         virtualMachineQueue: DispatchQueue,
-        hostSSHPort: UInt16,
         eventHandler: @escaping (String) -> Void
     ) {
         self.socketDevice = socketDevice
         self.virtualMachineQueue = virtualMachineQueue
-        self.guestControl = GuestPortForwardControl(hostSSHPort: hostSSHPort)
         self.eventHandler = eventHandler
     }
 
@@ -36,26 +33,19 @@ final class PortForwardManager: @unchecked Sendable {
             return
         }
 
-        try guestControl.start(port: port)
-
-        do {
-            let forward = TCPToVsockPortForward(
-                socketDevice: socketDevice,
-                virtualMachineQueue: virtualMachineQueue,
-                hostPort: port,
-                guestVsockPort: UInt32(port),
-                logPrefix: "port forward :\(port)",
-                eventHandler: eventHandler
-            )
-            try forward.start()
-            stateQueue.sync {
-                activeForwards[port] = forward
-            }
-            eventHandler("port forward enabled on 127.0.0.1:\(port)")
-        } catch {
-            try? guestControl.stop(port: port)
-            throw error
+        let forward = TCPToVsockPortForward(
+            socketDevice: socketDevice,
+            virtualMachineQueue: virtualMachineQueue,
+            hostPort: port,
+            guestVsockPort: UInt32(port),
+            logPrefix: "port forward :\(port)",
+            eventHandler: eventHandler
+        )
+        try forward.start()
+        stateQueue.sync {
+            activeForwards[port] = forward
         }
+        eventHandler("port forward enabled on 127.0.0.1:\(port)")
     }
 
     func disable(port: UInt16) throws {
@@ -71,7 +61,6 @@ final class PortForwardManager: @unchecked Sendable {
         }
 
         forward.stop()
-        try guestControl.stop(port: port)
         eventHandler("port forward disabled on 127.0.0.1:\(port)")
     }
 
@@ -83,8 +72,5 @@ final class PortForwardManager: @unchecked Sendable {
         }
 
         portsAndForwards.values.forEach { $0.stop() }
-        for port in portsAndForwards.keys {
-            try? guestControl.stop(port: port)
-        }
     }
 }

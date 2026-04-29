@@ -62,7 +62,6 @@ final class GuestServiceStack: @unchecked Sendable {
         portForwardManager = PortForwardManager(
             socketDevice: socketDevice,
             virtualMachineQueue: virtualMachineQueue,
-            hostSSHPort: config.hostSSHPort,
             eventHandler: eventHandler
         )
         eventHandler("port forwarding available: \(Constants.supportedForwardedTCPPorts.map(String.init).joined(separator: ", "))")

@@ -20,7 +20,6 @@ enum Constants {
     static let shutdownTimeoutSeconds: TimeInterval = 30
     static let supportedArchitecture = "aarch64"
     static let supportedForwardedTCPPorts: [UInt16] = [3000, 5173]
-    static let defaultGuestSSHUser = "braden"
 }
 
 struct VMName: Codable, Hashable, LosslessStringConvertible {
