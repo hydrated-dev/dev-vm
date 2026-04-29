@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Network
 @preconcurrency import Virtualization
 
 final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchecked Sendable {
@@ -24,7 +25,7 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
         self.approvalController = approvalController
         self.eventHandler = eventHandler
         caStore = try ProxyCAStore()
-        policy = HTTPSProxyPolicy(allowedDestinations: Constants.initialHTTPSProxyAllowlist)
+        policy = HTTPSProxyPolicy()
         secretStore = SecretStore()
         super.init()
         proxyListener.delegate = self
@@ -96,23 +97,15 @@ final class HTTPSProxyManager: NSObject, VZVirtioSocketListenerDelegate, @unchec
 }
 
 struct HTTPSProxyPolicy {
-    private let allowedDestinations: Set<String>
     private let allowedRequests: Set<String>
 
-    init(
-        allowedDestinations: Set<String>,
-        allowedRequests: Set<String> = Constants.initialHTTPSRequestAllowlist
-    ) {
-        self.allowedDestinations = allowedDestinations
+    init(allowedRequests: Set<String> = Constants.initialHTTPSRequestAllowlist) {
         self.allowedRequests = allowedRequests
     }
 
-    func allows(host: String, port: UInt16) -> Bool {
-        allowedDestinations.contains("\(host.lowercased()):\(port)")
-    }
-
-    func allows(request: HTTPSProxyRequest) -> Bool {
-        allowedRequests.contains(request.policyKey)
+    // Requests using secrets always require approval, even if the URL is allowlisted.
+    func allowsRequestWithoutPrompt(_ request: HTTPSProxyRequest) -> Bool {
+        allowedRequests.contains(request.policyKey) && request.secretNames.isEmpty
     }
 }
 
@@ -261,11 +254,21 @@ final class HTTPSProxySession: ManagedSession, @unchecked Sendable {
                         }
                     }
 
-                    let upstreamConnection = try NetworkTLSConnection.connect(host: connectRequest.host, port: connectRequest.port)
+                    let resolvedEndpoints = try resolveApprovedDestination(
+                        host: connectRequest.host,
+                        port: connectRequest.port
+                    )
+                    let upstreamConnection = try connectUpstream(
+                        hostname: connectRequest.host,
+                        port: connectRequest.port,
+                        resolvedEndpoints: resolvedEndpoints
+                    )
                     defer { upstreamConnection.cancel() }
-                    eventHandler("https proxy upstream TLS established for \(connectRequest.host):\(connectRequest.port)")
                     try mutatedRequest.write(to: upstreamConnection)
                     try NetworkConnectionRelay.relayResponse(from: upstreamConnection, to: guestConnection)
+                } catch let denied as HTTPSProxyDeniedError {
+                    try? guestConnection.sendBlocking(denied.responseData)
+                    throw denied
                 }
             }
         } catch {
@@ -273,10 +276,76 @@ final class HTTPSProxySession: ManagedSession, @unchecked Sendable {
         }
     }
 
+    // This is intentionally called only after request approval so no DNS or upstream
+    // connection metadata can leave the host before approval.
+    private func resolveApprovedDestination(host: String, port: UInt16) throws -> DestinationResolution.FilteredEndpoints {
+        do {
+            let resolved = try DestinationResolution.resolvePublicEndpoints(host: host, port: port)
+            logResolution(host: host, port: port, resolved: resolved)
+            return resolved
+        } catch let error as DestinationSafetyError {
+            eventHandler("https proxy blocked upstream \(host):\(port): \(error.localizedDescription)")
+            throw HTTPSProxyDeniedError(
+                status: blockedUpstreamStatus(for: error),
+                reason: blockedUpstreamStatus(for: error) == 403 ? "Forbidden" : "Bad Gateway",
+                message: "upstream destination was not allowed"
+            )
+        }
+    }
+
+    private func logResolution(
+        host: String,
+        port: UInt16,
+        resolved: DestinationResolution.FilteredEndpoints
+    ) {
+        if !resolved.blockedEndpoints.isEmpty {
+            let blocked = resolved.blockedEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            let allowed = resolved.publicEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            eventHandler(
+                "https proxy filtered upstream \(host):\(port); kept [\(allowed)] blocked [\(blocked)]"
+            )
+        } else {
+            let allowed = resolved.publicEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            eventHandler("https proxy resolved upstream \(host):\(port) to [\(allowed)]")
+        }
+    }
+
+    private func connectUpstream(
+        hostname: String,
+        port: UInt16,
+        resolvedEndpoints: DestinationResolution.FilteredEndpoints
+    ) throws -> NWConnection {
+        var lastError: Error?
+        for endpoint in resolvedEndpoints.publicEndpoints {
+            do {
+                let connection = try NetworkTLSConnection.connect(hostname: hostname, endpoint: endpoint)
+                eventHandler("https proxy upstream TLS established for \(hostname):\(port) via \(endpoint.ipAddress)")
+                return connection
+            } catch {
+                lastError = error
+                eventHandler("https proxy upstream connect failed for \(hostname):\(port) via \(endpoint.ipAddress): \(error.localizedDescription)")
+            }
+        }
+        throw lastError ?? CLIError("failed to connect to any validated endpoint for \(hostname):\(port)")
+    }
+
+    private func blockedUpstreamStatus(for error: DestinationSafetyError) -> Int {
+        switch error {
+        case .noPublicEndpoints:
+            return 403
+        case .resolutionFailed:
+            return 502
+        }
+    }
+
     private func approve(_ request: HTTPSProxyRequest) throws -> UUID? {
-        if policy.allows(request: request) || policy.allows(host: request.host, port: request.port) {
+        if policy.allowsRequestWithoutPrompt(request) {
             eventHandler("https proxy allowed \(request.displayName)")
             return nil
+        }
+
+        if !request.secretNames.isEmpty {
+            eventHandler("https proxy request uses secrets \(request.secretNames.joined(separator: ", ")) for \(request.displayName)")
         }
 
         guard let approvalController else {

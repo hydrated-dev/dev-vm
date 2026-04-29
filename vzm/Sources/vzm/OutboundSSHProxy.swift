@@ -112,20 +112,52 @@ final class OutboundSSHProxySession: ManagedSession, @unchecked Sendable {
                 approvalController?.finishRequest(requestID: approvalRequestID)
             }
 
-            let upstreamFD = try SocketSupport.connectTCP(
+            let resolvedEndpoints = try DestinationResolution.resolvePublicEndpoints(
                 host: Constants.initialOutboundSSHHost,
                 port: Constants.initialOutboundSSHPort
             )
+            logResolution(resolvedEndpoints)
+
+            let upstreamFD = try connectUpstream(using: resolvedEndpoints.publicEndpoints)
             defer {
                 SocketSupport.closeQuietly(upstreamFD)
             }
 
-            eventHandler("outbound ssh proxy connected \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort)")
             let relay = RawFDRelay(leftFD: connection.fileDescriptor, rightFD: upstreamFD)
             relay.start()
             relay.wait()
         } catch {
             eventHandler("outbound ssh proxy session failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func connectUpstream(using endpoints: [ResolvedEndpoint]) throws -> Int32 {
+        var lastError: Error?
+        for endpoint in endpoints {
+            do {
+                let fd = try SocketSupport.connectTCP(endpoint: endpoint)
+                eventHandler("outbound ssh proxy connected \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort) via \(endpoint.ipAddress)")
+                return fd
+            } catch {
+                lastError = error
+                eventHandler("outbound ssh proxy connect failed via \(endpoint.ipAddress): \(error.localizedDescription)")
+            }
+        }
+        throw lastError ?? CLIError("outbound ssh proxy had no validated upstream endpoints")
+    }
+
+    private func logResolution(_ resolved: DestinationResolution.FilteredEndpoints) {
+        if !resolved.blockedEndpoints.isEmpty {
+            let blocked = resolved.blockedEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            let allowed = resolved.publicEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            eventHandler(
+                "outbound ssh proxy filtered \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort); kept [\(allowed)] blocked [\(blocked)]"
+            )
+        } else {
+            let allowed = resolved.publicEndpoints.map(\.ipAddress).sorted().joined(separator: ", ")
+            eventHandler(
+                "outbound ssh proxy resolved \(Constants.initialOutboundSSHHost):\(Constants.initialOutboundSSHPort) to [\(allowed)]"
+            )
         }
     }
 

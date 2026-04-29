@@ -97,4 +97,29 @@ final class ParsingTests: XCTestCase {
         XCTAssertFalse(text.contains("Proxy-Connection:"))
         XCTAssertFalse(text.contains("keep-alive"))
     }
+
+    func testDestinationResolutionRejectsPrivateIPv4() throws {
+        let endpoint = try ResolvedEndpoint(hostname: "example.com", port: 443, ipAddress: "10.0.0.1")
+        XCTAssertFalse(DestinationResolution.isPublicEndpoint(endpoint))
+    }
+
+    func testDestinationResolutionAcceptsPublicIPv4() throws {
+        let endpoint = try ResolvedEndpoint(hostname: "example.com", port: 443, ipAddress: "8.8.8.8")
+        XCTAssertTrue(DestinationResolution.isPublicEndpoint(endpoint))
+    }
+
+    func testDestinationResolutionRejectsIPv4MappedLoopbackIPv6() throws {
+        let endpoint = try ResolvedEndpoint(hostname: "example.com", port: 443, ipAddress: "::ffff:127.0.0.1")
+        XCTAssertFalse(DestinationResolution.isPublicEndpoint(endpoint))
+    }
+
+    func testDestinationResolutionRejectsUniqueLocalIPv6() throws {
+        let endpoint = try ResolvedEndpoint(hostname: "example.com", port: 443, ipAddress: "fd00::1")
+        XCTAssertFalse(DestinationResolution.isPublicEndpoint(endpoint))
+    }
+
+    func testDestinationResolutionAcceptsPublicIPv6() throws {
+        let endpoint = try ResolvedEndpoint(hostname: "example.com", port: 443, ipAddress: "2606:4700:4700::1111")
+        XCTAssertTrue(DestinationResolution.isPublicEndpoint(endpoint))
+    }
 }

@@ -70,37 +70,33 @@ enum SocketSupport {
     }
 
     static func connectTCP(host: String, port: UInt16) throws -> Int32 {
-        var hints = addrinfo(
-            ai_flags: 0,
-            ai_family: AF_UNSPEC,
-            ai_socktype: SOCK_STREAM,
-            ai_protocol: IPPROTO_TCP,
-            ai_addrlen: 0,
-            ai_canonname: nil,
-            ai_addr: nil,
-            ai_next: nil
-        )
-        var result: UnsafeMutablePointer<addrinfo>?
-        let status = getaddrinfo(host, String(port), &hints, &result)
-        guard status == 0, let result else {
-            throw CLIError("failed to resolve \(host): \(String(cString: gai_strerror(status)))")
-        }
-        defer { freeaddrinfo(result) }
-
-        var cursor: UnsafeMutablePointer<addrinfo>? = result
+        let endpoints = try DestinationResolution.resolveEndpoints(host: host, port: port)
         var lastError = "unknown error"
-        while let info = cursor {
-            let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
-            if fd >= 0 {
-                if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
-                    return fd
-                }
-                lastError = String(cString: strerror(errno))
-                closeQuietly(fd)
+        for endpoint in endpoints {
+            do {
+                return try connectTCP(endpoint: endpoint)
+            } catch {
+                lastError = error.localizedDescription
             }
-            cursor = info.pointee.ai_next
+        }
+        throw CLIError("failed to connect to \(host):\(port): \(lastError)")
+    }
+
+    static func connectTCP(endpoint: ResolvedEndpoint) throws -> Int32 {
+        let fd = socket(endpoint.family, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else {
+            throw CLIError("failed to create TCP socket for \(endpoint.description): \(String(cString: strerror(errno)))")
         }
 
-        throw CLIError("failed to connect to \(host):\(port): \(lastError)")
+        let connectResult = endpoint.withSockAddrPointer { address, addressLength in
+            Darwin.connect(fd, address, addressLength)
+        }
+        guard connectResult == 0 else {
+            let message = String(cString: strerror(errno))
+            closeQuietly(fd)
+            throw CLIError("failed to connect to \(endpoint.description): \(message)")
+        }
+
+        return fd
     }
 }

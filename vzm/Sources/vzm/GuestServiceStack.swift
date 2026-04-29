@@ -36,7 +36,6 @@ final class GuestServiceStack: @unchecked Sendable {
         proxy.start()
         httpsProxy = proxy
         eventHandler("https proxy listening on vsock port \(Constants.hostHTTPSProxyVsockPort)")
-        eventHandler("https proxy allowlist: \(Constants.initialHTTPSProxyAllowlist.sorted().joined(separator: ", "))")
         eventHandler("https request allowlist: \(Constants.initialHTTPSRequestAllowlist.sorted().joined(separator: ", "))")
 
         let outboundSSHProxy = OutboundSSHProxyManager(

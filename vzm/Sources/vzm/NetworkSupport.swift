@@ -4,19 +4,25 @@ import Network
 import Security
 
 enum NetworkTLSConnection {
-    static func connect(host: String, port: UInt16) throws -> NWConnection {
+    static func connect(hostname: String, endpoint: ResolvedEndpoint) throws -> NWConnection {
         let tlsOptions = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, host)
+        sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, hostname)
+        sec_protocol_options_set_verify_block(tlsOptions.securityProtocolOptions, { _, trust, complete in
+            let secTrust = sec_trust_copy_ref(trust).takeRetainedValue()
+            let policy = SecPolicyCreateSSL(true, hostname as CFString)
+            SecTrustSetPolicies(secTrust, policy)
+            complete(SecTrustEvaluateWithError(secTrust, nil))
+        }, DispatchQueue.global())
         TLSOptions.forceHTTP11(tlsOptions)
         let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
         parameters.preferNoProxies = true
 
         let connection = NWConnection(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!,
+            host: NWEndpoint.Host(endpoint.ipAddress),
+            port: NWEndpoint.Port(rawValue: endpoint.port)!,
             using: parameters
         )
-        try connection.startAndWait(queue: DispatchQueue(label: "vzm.https-proxy.upstream.\(host)"))
+        try connection.startAndWait(queue: DispatchQueue(label: "vzm.https-proxy.upstream.\(hostname).\(endpoint.ipAddress)"))
         return connection
     }
 }
