@@ -28,13 +28,35 @@ final class ParsingTests: XCTestCase {
 
     func testHTTPRequestParserHandlesAbsoluteForm() throws {
         let data = Data("POST https://Example.COM:8443/api HTTP/1.1\r\nHost: ignored.test\r\nContent-Length: 4\r\n\r\nbody".utf8)
-        let parsed = try HTTPRequestParser.parse(data, connectHost: "ignored.test", connectPort: 443)
+        let parsed = try HTTPRequestParser.parse(data, connectHost: "example.com", connectPort: 8443)
 
         XCTAssertEqual(parsed.request.method, "POST")
         XCTAssertEqual(parsed.request.host, "example.com")
         XCTAssertEqual(parsed.request.port, 8443)
         XCTAssertEqual(parsed.request.url, "https://example.com:8443/api")
         XCTAssertEqual(parsed.contentLength, 4)
+    }
+
+    func testHTTPRequestParserRejectsOriginFormHostMismatch() throws {
+        let data = Data("GET /path HTTP/1.1\r\nHost: allowed.example\r\n\r\n".utf8)
+
+        XCTAssertThrowsError(try HTTPRequestParser.parse(data, connectHost: "attacker.example", connectPort: 443)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "HTTP request authority allowed.example:443 did not match CONNECT destination attacker.example:443"
+            )
+        }
+    }
+
+    func testHTTPRequestParserRejectsAbsoluteFormAuthorityMismatch() throws {
+        let data = Data("POST https://allowed.example/api HTTP/1.1\r\nHost: ignored.test\r\nContent-Length: 4\r\n\r\nbody".utf8)
+
+        XCTAssertThrowsError(try HTTPRequestParser.parse(data, connectHost: "attacker.example", connectPort: 443)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "HTTP request authority allowed.example:443 did not match CONNECT destination attacker.example:443"
+            )
+        }
     }
 
     func testSecretReferenceDetection() throws {

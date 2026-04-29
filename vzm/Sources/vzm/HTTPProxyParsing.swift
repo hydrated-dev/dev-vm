@@ -171,6 +171,12 @@ enum HTTPRequestParser {
             throw CLIError("HTTP request target must be origin-form or absolute-form")
         }
 
+        guard requestHost == connectHost.lowercased(), requestPort == connectPort else {
+            throw CLIError(
+                "HTTP request authority \(requestHost):\(requestPort) did not match CONNECT destination \(connectHost.lowercased()):\(connectPort)"
+            )
+        }
+
         let request = HTTPSProxyRequest(
             method: method,
             scheme: scheme,
