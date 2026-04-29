@@ -72,6 +72,15 @@ enum NetworkConnectionRelay {
         }
     }
 
+    static func relayResponse(from source: NWConnection, to destination: NWConnection) throws {
+        while true {
+            guard let data = try source.receiveBlocking(maxLength: 16 * 1024) else {
+                return
+            }
+            try destination.sendBlocking(data)
+        }
+    }
+
     private static func pump(from source: NWConnection, to destination: NWConnection) throws {
         while true {
             guard let data = try source.receiveBlocking(maxLength: 16 * 1024) else {

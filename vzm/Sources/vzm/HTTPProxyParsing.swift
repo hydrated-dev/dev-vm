@@ -80,47 +80,82 @@ struct ParsedHTTPRequest {
     let contentLength: Int?
 }
 
+struct HTTPRequestReadResult {
+    let request: ParsedHTTPRequest
+    let remainingBytes: Data
+}
+
 enum HTTPRequestParser {
-    static func readFirstRequest(
+    static func readNextRequest(
         from connection: NWConnection,
+        bufferedData initialData: Data,
         connectHost: String,
         connectPort: UInt16
-    ) throws -> ParsedHTTPRequest {
-        var data = Data()
+    ) throws -> HTTPRequestReadResult? {
+        var data = initialData
         let headerTerminator = Data([13, 10, 13, 10])
 
         while data.count < 64 * 1024 {
-            guard let chunk = try connection.receiveBlocking(maxLength: 16 * 1024) else {
-                throw CLIError("guest closed TLS before sending HTTP request")
-            }
-            data.append(chunk)
-
             if data.starts(with: Data("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8)) {
                 throw CLIError("guest attempted HTTP/2 despite proxy HTTP/1.1 ALPN")
             }
-            if data.range(of: headerTerminator) != nil {
-                var parsed = try parse(data, connectHost: connectHost, connectPort: connectPort)
-                if let contentLength = parsed.contentLength {
+            if let headerRange = data.range(of: headerTerminator) {
+                let headerEnd = headerRange.lowerBound
+                let bodyStartIndex = headerEnd + 4
+                let headerBytes = data.prefix(upTo: headerEnd)
+                guard let headerText = String(data: headerBytes, encoding: .utf8) else {
+                    throw CLIError("HTTP request headers were not valid UTF-8")
+                }
+
+                let lines = headerText.components(separatedBy: "\r\n")
+                let contentLength = try contentLength(in: lines)
+                if headerValue(named: "transfer-encoding", in: lines) != nil {
+                    throw CLIError("proxy does not support Transfer-Encoding request bodies")
+                }
+
+                let expectedByteCount = bodyStartIndex + (contentLength ?? 0)
+                if let contentLength {
                     guard contentLength <= Constants.maxHTTPSProxyBufferedBodyBytes else {
                         throw CLIError("HTTP request body exceeded \(Constants.maxHTTPSProxyBufferedBodyBytes) byte proxy buffering limit")
                     }
-                    let expectedByteCount = parsed.bodyStartIndex + contentLength
-                    while data.count < expectedByteCount {
-                        guard let chunk = try connection.receiveBlocking(maxLength: min(16 * 1024, expectedByteCount - data.count)) else {
-                            throw CLIError("guest closed TLS before sending complete HTTP request body")
-                        }
-                        data.append(chunk)
-                    }
-                    parsed = try parse(data, connectHost: connectHost, connectPort: connectPort)
                 }
-                return parsed
+
+                while data.count < expectedByteCount {
+                    guard let chunk = try connection.receiveBlocking(maxLength: min(16 * 1024, expectedByteCount - data.count)) else {
+                        throw CLIError("guest closed TLS before sending complete HTTP request body")
+                    }
+                    data.append(chunk)
+                }
+
+                let requestBytes = Data(data.prefix(expectedByteCount))
+                let remainingBytes = Data(data.dropFirst(expectedByteCount))
+                let parsed = try parse(
+                    requestBytes,
+                    connectHost: connectHost,
+                    connectPort: connectPort,
+                    contentLengthOverride: contentLength
+                )
+                return HTTPRequestReadResult(request: parsed, remainingBytes: remainingBytes)
             }
+
+            guard let chunk = try connection.receiveBlocking(maxLength: 16 * 1024) else {
+                if data.isEmpty {
+                    return nil
+                }
+                throw CLIError("guest closed TLS before sending HTTP request")
+            }
+            data.append(chunk)
         }
 
         throw CLIError("HTTP request headers exceeded 64 KiB")
     }
 
-    static func parse(_ data: Data, connectHost: String, connectPort: UInt16) throws -> ParsedHTTPRequest {
+    static func parse(
+        _ data: Data,
+        connectHost: String,
+        connectPort: UInt16,
+        contentLengthOverride: Int? = nil
+    ) throws -> ParsedHTTPRequest {
         guard let headerEnd = data.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
             throw CLIError("HTTP request headers were incomplete")
         }
@@ -191,7 +226,7 @@ enum HTTPRequestParser {
             request: request,
             bytes: data,
             bodyStartIndex: bodyStartIndex,
-            contentLength: try contentLength(in: lines)
+            contentLength: try (contentLengthOverride ?? contentLength(in: lines))
         )
     }
 
@@ -327,7 +362,54 @@ struct MutatedHTTPRequest {
     let request: HTTPSProxyRequest
     let bytes: Data
 
+    func preparedForUpstream() throws -> Data {
+        guard let headerEnd = bytes.range(of: Data([13, 10, 13, 10]))?.lowerBound else {
+            throw CLIError("mutated HTTP request headers were incomplete")
+        }
+        let bodyStartIndex = headerEnd + 4
+        let headerBytes = bytes.prefix(upTo: headerEnd)
+        let bodyBytes = bytes.dropFirst(bodyStartIndex)
+        guard let headerText = String(data: headerBytes, encoding: .utf8) else {
+            throw CLIError("mutated HTTP request headers were not valid UTF-8")
+        }
+
+        let lines = headerText.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else {
+            throw CLIError("mutated HTTP request line was missing")
+        }
+
+        var rewrittenLines = [requestLine]
+        var insertedConnectionClose = false
+        for line in lines.dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else {
+                rewrittenLines.append(line)
+                continue
+            }
+
+            let headerName = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if headerName == "proxy-connection" {
+                continue
+            }
+            if headerName == "connection" {
+                rewrittenLines.append("Connection: close")
+                insertedConnectionClose = true
+                continue
+            }
+            rewrittenLines.append(line)
+        }
+
+        if !insertedConnectionClose {
+            rewrittenLines.append("Connection: close")
+        }
+
+        var rewritten = Data(rewrittenLines.joined(separator: "\r\n").utf8)
+        rewritten.append(Data([13, 10, 13, 10]))
+        rewritten.append(bodyBytes)
+        return rewritten
+    }
+
     func write(to connection: NWConnection) throws {
-        try connection.sendBlocking(bytes)
+        try connection.sendBlocking(preparedForUpstream())
     }
 }

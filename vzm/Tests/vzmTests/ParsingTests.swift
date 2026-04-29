@@ -65,4 +65,36 @@ final class ParsingTests: XCTestCase {
 
         XCTAssertEqual(references.map(\.id), [id])
     }
+
+    func testHTTPRequestParserRejectsTransferEncodingRequestBodies() throws {
+        let data = Data("POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
+
+        XCTAssertThrowsError(
+            try HTTPRequestParser.parse(data, connectHost: "example.com", connectPort: 443)
+        ) { error in
+            XCTAssertEqual(error.localizedDescription, "proxy does not support Transfer-Encoding request bodies")
+        }
+    }
+
+    func testMutatedRequestPreparedForUpstreamForcesConnectionClose() throws {
+        let request = MutatedHTTPRequest(
+            request: HTTPSProxyRequest(
+                method: "GET",
+                scheme: "https",
+                host: "example.com",
+                port: 443,
+                path: "/",
+                url: "https://example.com/",
+                httpVersion: "HTTP/1.1",
+                secretNames: []
+            ),
+            bytes: Data("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n".utf8)
+        )
+
+        let prepared = try request.preparedForUpstream()
+        let text = try XCTUnwrap(String(data: prepared, encoding: .utf8))
+        XCTAssertTrue(text.contains("\r\nConnection: close\r\n"))
+        XCTAssertFalse(text.contains("Proxy-Connection:"))
+        XCTAssertFalse(text.contains("keep-alive"))
+    }
 }

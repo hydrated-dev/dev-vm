@@ -208,51 +208,66 @@ final class HTTPSProxySession: ManagedSession, @unchecked Sendable {
             let guestConnection = try guestTLS.acceptConnection()
             eventHandler("https proxy guest TLS established for \(connectRequest.host)")
 
-            let initialRequest: ParsedHTTPRequest
-            do {
-                initialRequest = try HTTPRequestParser.readFirstRequest(
-                    from: guestConnection,
-                    connectHost: connectRequest.host,
-                    connectPort: connectRequest.port
-                )
-            } catch {
-                let rejected = HTTPSProxyDeniedError(
-                    status: 505,
-                    reason: "HTTP Version Not Supported",
-                    message: error.localizedDescription
-                )
-                try? guestConnection.sendBlocking(rejected.responseData)
-                throw error
-            }
-            let mutatedRequest: MutatedHTTPRequest
-            do {
-                mutatedRequest = try HTTPRequestMutator(secretStore: secretStore).mutate(initialRequest)
-            } catch {
-                let rejected = HTTPSProxyDeniedError(
-                    status: 502,
-                    reason: "Bad Gateway",
-                    message: error.localizedDescription
-                )
-                try? guestConnection.sendBlocking(rejected.responseData)
-                throw error
-            }
-            let approvalRequestID: UUID?
-            do {
-                approvalRequestID = try approve(mutatedRequest.request)
-            } catch let denied as HTTPSProxyDeniedError {
-                try? guestConnection.sendBlocking(denied.responseData)
-                throw denied
-            }
-            defer {
-                if let approvalRequestID {
-                    approvalController?.finishRequest(requestID: approvalRequestID)
+            var bufferedGuestData = Data()
+            requestLoop: while true {
+                let nextRequest: HTTPRequestReadResult?
+                do {
+                    nextRequest = try HTTPRequestParser.readNextRequest(
+                        from: guestConnection,
+                        bufferedData: bufferedGuestData,
+                        connectHost: connectRequest.host,
+                        connectPort: connectRequest.port
+                    )
+                } catch {
+                    let rejected = HTTPSProxyDeniedError(
+                        status: 505,
+                        reason: "HTTP Version Not Supported",
+                        message: error.localizedDescription
+                    )
+                    try? guestConnection.sendBlocking(rejected.responseData)
+                    throw error
+                }
+
+                guard let nextRequest else {
+                    break requestLoop
+                }
+                bufferedGuestData = nextRequest.remainingBytes
+
+                let mutatedRequest: MutatedHTTPRequest
+                do {
+                    mutatedRequest = try HTTPRequestMutator(secretStore: secretStore).mutate(nextRequest.request)
+                } catch {
+                    let rejected = HTTPSProxyDeniedError(
+                        status: 502,
+                        reason: "Bad Gateway",
+                        message: error.localizedDescription
+                    )
+                    try? guestConnection.sendBlocking(rejected.responseData)
+                    throw error
+                }
+
+                let approvalRequestID: UUID?
+                do {
+                    approvalRequestID = try approve(mutatedRequest.request)
+                } catch let denied as HTTPSProxyDeniedError {
+                    try? guestConnection.sendBlocking(denied.responseData)
+                    throw denied
+                }
+
+                do {
+                    defer {
+                        if let approvalRequestID {
+                            approvalController?.finishRequest(requestID: approvalRequestID)
+                        }
+                    }
+
+                    let upstreamConnection = try NetworkTLSConnection.connect(host: connectRequest.host, port: connectRequest.port)
+                    defer { upstreamConnection.cancel() }
+                    eventHandler("https proxy upstream TLS established for \(connectRequest.host):\(connectRequest.port)")
+                    try mutatedRequest.write(to: upstreamConnection)
+                    try NetworkConnectionRelay.relayResponse(from: upstreamConnection, to: guestConnection)
                 }
             }
-
-            let upstreamConnection = try NetworkTLSConnection.connect(host: connectRequest.host, port: connectRequest.port)
-            eventHandler("https proxy upstream TLS established for \(connectRequest.host):\(connectRequest.port)")
-            try mutatedRequest.write(to: upstreamConnection)
-            try NetworkConnectionRelay.relay(left: guestConnection, right: upstreamConnection)
         } catch {
             eventHandler("https proxy session failed: \(error.localizedDescription)")
         }
