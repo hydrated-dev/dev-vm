@@ -134,6 +134,21 @@
     NIX_SSL_CERT_FILE = "/run/vzm/ca-bundle.crt";
   };
 
+  # The interactive `nix` client may see the proxy environment above, but
+  # actual downloads are often performed by the system nix-daemon. Propagate
+  # the same proxy/CA settings there so substituter fetches also traverse the
+  # host HTTPS proxy and trigger approvals instead of attempting direct DNS.
+  systemd.services.nix-daemon.environment = {
+    HTTP_PROXY = "http://127.0.0.1:3128";
+    HTTPS_PROXY = "http://127.0.0.1:3128";
+    http_proxy = "http://127.0.0.1:3128";
+    https_proxy = "http://127.0.0.1:3128";
+    NO_PROXY = "localhost,127.0.0.1,::1";
+    no_proxy = "localhost,127.0.0.1,::1";
+    SSL_CERT_FILE = "/run/vzm/ca-bundle.crt";
+    NIX_SSL_CERT_FILE = "/run/vzm/ca-bundle.crt";
+  };
+
   systemd.services.vzm-proxy-ca = {
     description = "Fetch the vzm HTTPS proxy CA from the host";
     wantedBy = [ "multi-user.target" ];
