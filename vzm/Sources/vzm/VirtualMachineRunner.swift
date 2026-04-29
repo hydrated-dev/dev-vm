@@ -18,8 +18,6 @@ final class VirtualMachineRunner: NSObject, PortForwardingController, @unchecked
     private var sigtermSource: DispatchSourceSignal?
     private let completionSemaphore = DispatchSemaphore(value: 0)
     private var exitError: Error?
-    private var consoleInputHandle: FileHandle?
-    private var consoleOutputHandle: FileHandle?
 
     init(
         config: VMConfig,
@@ -235,20 +233,6 @@ final class VirtualMachineRunner: NSObject, PortForwardingController, @unchecked
         bootLoader.initialRamdiskURL = bundle.initrdURL
         bootLoader.commandLine = bundle.manifest.commandLine
 
-        guard let consoleInputHandle = FileHandle(forReadingAtPath: "/dev/null") else {
-            throw CLIError("failed to open /dev/null for guest console input")
-        }
-        let consoleOutputHandle = FileHandle.standardOutput
-        self.consoleInputHandle = consoleInputHandle
-        self.consoleOutputHandle = consoleOutputHandle
-
-        let consoleAttachment = VZFileHandleSerialPortAttachment(
-            fileHandleForReading: consoleInputHandle,
-            fileHandleForWriting: consoleOutputHandle
-        )
-        let consolePort = VZVirtioConsoleDeviceSerialPortConfiguration()
-        consolePort.attachment = consoleAttachment
-
         let vmConfiguration = VZVirtualMachineConfiguration()
         vmConfiguration.bootLoader = bootLoader
         vmConfiguration.platform = platform
@@ -258,7 +242,6 @@ final class VirtualMachineRunner: NSObject, PortForwardingController, @unchecked
             VZVirtioBlockDeviceConfiguration(attachment: rootDiskAttachment),
             VZVirtioBlockDeviceConfiguration(attachment: dataDiskAttachment),
         ]
-        vmConfiguration.serialPorts = [consolePort]
         vmConfiguration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         vmConfiguration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
