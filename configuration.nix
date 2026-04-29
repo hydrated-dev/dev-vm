@@ -74,7 +74,6 @@
 
   boot.kernelPackages = pkgs.linuxPackages_latest;
   boot.supportedFilesystems.zfs = lib.mkForce false;
-  boot.kernelParams = [ "console=hvc0" ];
 
   fileSystems."/" = {
     device = "/dev/disk/by-label/vzm-root";
