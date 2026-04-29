@@ -75,6 +75,11 @@ protocol ProxyApprovalController: AnyObject {
     func cancelAllPendingRequests()
 }
 
+protocol PortForwardingController: AnyObject {
+    func isPortForwardEnabled(_ port: UInt16) -> Bool
+    func setPortForwardingEnabled(_ enabled: Bool, for port: UInt16) throws
+}
+
 private final class PendingProxyApproval: @unchecked Sendable {
     let id = UUID()
     let request: ProxyApprovalRequest
@@ -119,6 +124,7 @@ private final class PendingProxyApproval: @unchecked Sendable {
 
 final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @unchecked Sendable {
     var stopRequested: (() -> Void)?
+    weak var portForwardingController: PortForwardingController?
 
     private let eventHandler: (String) -> Void
     private let lock = NSLock()
@@ -130,6 +136,8 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     private var protocolItem: NSMenuItem?
     private var approveItem: NSMenuItem?
     private var denyItem: NSMenuItem?
+    private var portForward3000Item: NSMenuItem?
+    private var portForward5173Item: NSMenuItem?
     private var hotKeys: ProxyApprovalHotKeys?
 
     init(eventHandler: @escaping (String) -> Void) {
@@ -163,6 +171,22 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
         menu.addItem(.separator())
         menu.addItem(approveItem!)
         menu.addItem(denyItem!)
+        menu.addItem(.separator())
+
+        let portForwardHeader = NSMenuItem(title: "Port Forwarding", action: nil, keyEquivalent: "")
+        portForwardHeader.isEnabled = false
+        menu.addItem(portForwardHeader)
+
+        let portForward3000Item = NSMenuItem(title: "Enable :3000", action: #selector(togglePort3000), keyEquivalent: "")
+        portForward3000Item.target = self
+        menu.addItem(portForward3000Item)
+        self.portForward3000Item = portForward3000Item
+
+        let portForward5173Item = NSMenuItem(title: "Enable :5173", action: #selector(togglePort5173), keyEquivalent: "")
+        portForward5173Item.target = self
+        menu.addItem(portForward5173Item)
+        self.portForward5173Item = portForward5173Item
+
         menu.addItem(.separator())
 
         let stopItem = NSMenuItem(title: "Stop VM", action: #selector(stopVM), keyEquivalent: "q")
@@ -246,6 +270,16 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     }
 
     @MainActor
+    @objc private func togglePort3000() {
+        togglePort(3000)
+    }
+
+    @MainActor
+    @objc private func togglePort5173() {
+        togglePort(5173)
+    }
+
+    @MainActor
     private func installHotKeys() {
         let hotKeys = ProxyApprovalHotKeys(
             approve: { [weak self] in
@@ -296,10 +330,36 @@ final class MenuBarProxyApprovalController: NSObject, ProxyApprovalController, @
     }
 
     @MainActor
+    private func togglePort(_ port: UInt16) {
+        guard let portForwardingController else {
+            eventHandler("port forwarding controller unavailable for 127.0.0.1:\(port)")
+            refreshMenu()
+            return
+        }
+
+        do {
+            let shouldEnable = !portForwardingController.isPortForwardEnabled(port)
+            try portForwardingController.setPortForwardingEnabled(shouldEnable, for: port)
+        } catch {
+            eventHandler("port forwarding update failed for 127.0.0.1:\(port): \(error.localizedDescription)")
+        }
+        refreshMenu()
+    }
+
+    @MainActor
     private func refreshMenu() {
         precondition(Thread.isMainThread)
         let request = currentRequest()
         let count = pendingCount()
+
+        let port3000Enabled = portForwardingController?.isPortForwardEnabled(3000) ?? false
+        let port5173Enabled = portForwardingController?.isPortForwardEnabled(5173) ?? false
+        portForward3000Item?.title = port3000Enabled ? "Disable :3000" : "Enable :3000"
+        portForward5173Item?.title = port5173Enabled ? "Disable :5173" : "Enable :5173"
+        portForward3000Item?.state = port3000Enabled ? .on : .off
+        portForward5173Item?.state = port5173Enabled ? .on : .off
+        portForward3000Item?.isEnabled = portForwardingController != nil
+        portForward5173Item?.isEnabled = portForwardingController != nil
 
         if let request {
             let countPrefix = count > 1 ? "(\(count)) " : ""

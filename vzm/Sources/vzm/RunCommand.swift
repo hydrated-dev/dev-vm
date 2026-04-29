@@ -40,6 +40,7 @@ struct RunCommand {
             approvalController: approvalController,
             eventHandler: eventHandler
         )
+        approvalController.portForwardingController = runner
         approvalController.stopRequested = {
             runner.requestShutdown()
         }

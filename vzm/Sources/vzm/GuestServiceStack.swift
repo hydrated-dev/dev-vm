@@ -11,6 +11,7 @@ final class GuestServiceStack: @unchecked Sendable {
     private var bridge: SSHBridge?
     private var httpsProxy: HTTPSProxyManager?
     private var outboundSSHProxy: OutboundSSHProxyManager?
+    private var portForwardManager: PortForwardManager?
 
     init(
         socketDevice: VZVirtioSocketDevice,
@@ -57,9 +58,36 @@ final class GuestServiceStack: @unchecked Sendable {
         try bridge.start()
         self.bridge = bridge
         eventHandler("ssh bridge listening on 127.0.0.1:\(config.hostSSHPort)")
+
+        portForwardManager = PortForwardManager(
+            socketDevice: socketDevice,
+            virtualMachineQueue: virtualMachineQueue,
+            hostSSHPort: config.hostSSHPort,
+            eventHandler: eventHandler
+        )
+        eventHandler("port forwarding available: \(Constants.supportedForwardedTCPPorts.map(String.init).joined(separator: ", "))")
+    }
+
+    func isPortForwardEnabled(_ port: UInt16) -> Bool {
+        portForwardManager?.isEnabled(port: port) ?? false
+    }
+
+    func enablePortForwarding(_ port: UInt16) throws {
+        guard let portForwardManager else {
+            throw CLIError("port forwarding is not available")
+        }
+        try portForwardManager.enable(port: port)
+    }
+
+    func disablePortForwarding(_ port: UInt16) throws {
+        guard let portForwardManager else {
+            throw CLIError("port forwarding is not available")
+        }
+        try portForwardManager.disable(port: port)
     }
 
     func stop() {
+        portForwardManager?.stop()
         httpsProxy?.stop()
         outboundSSHProxy?.stop()
         bridge?.stop()

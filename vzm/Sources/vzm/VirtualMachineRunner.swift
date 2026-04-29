@@ -2,7 +2,7 @@ import Foundation
 import Dispatch
 @preconcurrency import Virtualization
 
-final class VirtualMachineRunner: NSObject, @unchecked Sendable {
+final class VirtualMachineRunner: NSObject, PortForwardingController, @unchecked Sendable {
     private let config: VMConfig
     private let bundle: ValidatedGuestBundle
     private let machineIdentifier: VZGenericMachineIdentifier
@@ -179,6 +179,44 @@ final class VirtualMachineRunner: NSObject, @unchecked Sendable {
         }
         termSource.resume()
         sigtermSource = termSource
+    }
+
+    func isPortForwardEnabled(_ port: UInt16) -> Bool {
+        queue.sync {
+            guestServices?.isPortForwardEnabled(port) ?? false
+        }
+    }
+
+    func setPortForwardingEnabled(_ enabled: Bool, for port: UInt16) throws {
+        let errorBox = SynchronizedValue<Error?>(nil)
+        let semaphore = DispatchSemaphore(value: 0)
+
+        queue.async { [weak self] in
+            defer { semaphore.signal() }
+            guard let self else {
+                errorBox.set(CLIError("virtual machine is no longer available"))
+                return
+            }
+            guard let guestServices = self.guestServices else {
+                errorBox.set(CLIError("port forwarding is not available until the VM finishes starting"))
+                return
+            }
+
+            do {
+                if enabled {
+                    try guestServices.enablePortForwarding(port)
+                } else {
+                    try guestServices.disablePortForwarding(port)
+                }
+            } catch {
+                errorBox.set(error)
+            }
+        }
+
+        semaphore.wait()
+        if let error = errorBox.value {
+            throw error
+        }
     }
 
     private func makeConfiguration() throws -> VZVirtualMachineConfiguration {
